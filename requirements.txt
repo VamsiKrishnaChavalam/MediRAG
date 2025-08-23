@@ -1,0 +1,16 @@
+openai
+pinecone
+pinecone-text 
+pinecone-notebooks
+langchain 
+transformers 
+huggingface_hub
+langchain-text-splitters 
+langchain-community
+streamlit
+torch
+nltk
+langchain-huggingface
+pytesseract
+pinecone
+pdf2image
