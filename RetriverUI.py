@@ -1,29 +1,20 @@
-# application.py
 import os
 import re
 import json
 import time
 import tempfile
 from datetime import datetime
-
 import streamlit as st
 import nltk
 import pytesseract
 from pdf2image import convert_from_path
-
-# Pinecone & hybrid search (new pinecone package)
 from pinecone import Pinecone
 from pinecone_text.sparse import BM25Encoder
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.retrievers import PineconeHybridSearchRetriever
-
-# OpenAI-compatible (Groq) client
 import openai
 import pandas as pd
 
-# -----------------------------
-# One-time NLTK setup
-# -----------------------------
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
@@ -479,8 +470,6 @@ def get_secret(name, default=None):
     except Exception:
         return os.environ.get(name, default)
 
-# You can set these values using environment variables or .streamlit/secrets.toml.
-# Example env var names: LLM_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME, HF_TOKEN
 LLM_API_KEY = "your api key "
 PINECONE_API_KEY = "your pinecone db key"
 
@@ -916,7 +905,6 @@ with tab_chat:
                                         "response": m["content"],
                                         "feedback": "The response is relevant"
                                     })
-                                    # 🔥 Update logs + save to CSV
                                 if st.session_state.get("logs"):
                                         st.session_state.logs[-1]["feedback"] = "Relevant response was provided"
                                         pd.DataFrame(st.session_state.logs).to_csv("logs/metrics.csv", index=False)
@@ -928,7 +916,6 @@ with tab_chat:
                                         "response": m["content"],
                                         "feedback": "The response is not relevant"
                                     })
-                                    # 🔥 Update logs + save to CSV
                                 if st.session_state.get("logs"):
                                     st.session_state.logs[-1]["feedback"] = "Irrelevant response was provided"
                                     pd.DataFrame(st.session_state.logs).to_csv("logs/metrics.csv", index=False)
@@ -1161,4 +1148,5 @@ with tab_metrics:
                     except Exception:
                         reasons = {"raw": row.get("judge_reasons")}
                     st.json(reasons)
+
 
