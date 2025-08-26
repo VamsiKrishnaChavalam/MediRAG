@@ -1,34 +1,41 @@
+# application.py
 import os
 import re
-import openai
+import json
+import time
 import tempfile
-import pytesseract
-import pinecone
+from datetime import datetime
+
 import streamlit as st
 import nltk
+import pytesseract
 from pdf2image import convert_from_path
+
+# Pinecone & hybrid search (new pinecone package)
 from pinecone import Pinecone
 from pinecone_text.sparse import BM25Encoder
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.retrievers import PineconeHybridSearchRetriever
-import json
-from datetime import datetime
 
-# Download NLTK data
+# OpenAI-compatible (Groq) client
+import openai
+import pandas as pd
+
+# -----------------------------
+# One-time NLTK setup
+# -----------------------------
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download("punkt", quiet=True)
 
-# Page configuration
-st.set_page_config(
-    page_title="MediRAG - AI Medical Assistant",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# -----------------------------
+# Streamlit page config & CSS
+# -----------------------------
+st.set_page_config(page_title="MediRAG - AI Medical Assistant", layout="wide", initial_sidebar_state="expanded")
 
-# Custom CSS matching the dark theme from HTML
 st.markdown("""
+
 <style>
     /* Import Google Fonts */
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -188,7 +195,7 @@ st.markdown("""
     }
     
     .message-avatar {
-        width: 30px;
+        width: 40px;
         height: 30px;
         border-radius: 2px;
         display: flex;
@@ -422,102 +429,186 @@ st.markdown("""
         font-size: 0.75rem;
         color: #8e8ea0;
     }
+      /* Fix metric numbers */
+    [data-testid="stMetricValue"] {
+        color: #00FFAA !important;   /* bright teal */
+        font-weight: 700;
+        font-size: 1.5rem;
+    }
+
+    /* Fix metric labels */
+    [data-testid="stMetricLabel"] {
+        color: #FFFFFF !important;   /* white */
+        font-weight: 500;
+    }
+    <style>
+    [data-testid="stMetricValue"] {
+        color: #00FFAA !important;   /* bright teal */
+        font-weight: 700;
+    }
+    [data-testid="stMetricLabel"] {
+        color: #FFFFFF !important;
+    }
+
+
+    /* Fix dataframe / judge reasons table */
+    .stDataFrame, .stDataFrame td, .stDataFrame th {
+        color: #ECECF1 !important;   /* light grey text */
+        font-size: 0.9rem;
+    }
+
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize configuration and clients
+# -----------------------------
+# Config & secrets
+# -----------------------------
+def get_secret(name, default=None):
+    """
+    Prefer Streamlit secrets, then env var, then default.
+    This avoids requiring a separate file if you provide env vars.
+    """
+    try:
+        # st.secrets throws if no secrets.toml present; use get safely
+        val = None
+        try:
+            val = st.secrets.get(name)
+        except Exception:
+            val = None
+        return val if val is not None else os.environ.get(name, default)
+    except Exception:
+        return os.environ.get(name, default)
+
+# You can set these values using environment variables or .streamlit/secrets.toml.
+# Example env var names: LLM_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME, HF_TOKEN
+LLM_API_KEY = "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"
+PINECONE_API_KEY = "pcsk_bGiUC_6wqctEnz2zymTRVFs7dKzhF5xQGnMwsQh8fnwqNAmKpNBntzAwFeL4WmoDiDFJc"
+
+PINECONE_INDEX_NAME = "medirag"
+HF_TOKEN = "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"
+
+GEN_MODEL =  "llama3-70b-8192"
+JUDGE_MODEL = "llama3-70b-8192" 
+
+
+
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+
+# -----------------------------
+# Initialize services
+# -----------------------------
 @st.cache_resource
 def initialize_services():
-    """Initialize all services with error handling"""
     try:
-        # Configuration
-        LLM_API_KEY = "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"
-        PINECONE_API_KEY = "pcsk_bGiUC_6wqctEnz2zymTRVFs7dKzhF5xQGnMwsQh8fnwqNAmKpNBntzAwFeL4WmoDiDFJc"
-        PINECONE_INDEX_NAME = "medirag"
-        HF_TOKEN = "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"
-        os.environ["HF_TOKEN"] = HF_TOKEN
-        
-        # Initialize clients
+        if not (LLM_API_KEY and PINECONE_API_KEY):
+            # Allow continuing in dev even if keys not present, but mark unhealthy
+            raise RuntimeError("Missing LLM_API_KEY or PINECONE_API_KEY")
+
         llm_client = openai.OpenAI(base_url="https://api.groq.com/openai/v1", api_key=LLM_API_KEY)
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index(PINECONE_INDEX_NAME)
+
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        
-        # Load or create BM25 encoder
         bm25_path = "rag-veda.json"
         if os.path.exists(bm25_path):
             bm25_encoder = BM25Encoder().load(bm25_path)
         else:
             bm25_encoder = BM25Encoder()
-        
-        # Initialize retriever
+
         retriever = PineconeHybridSearchRetriever(
             embeddings=embeddings,
             sparse_encoder=bm25_encoder,
             index=index
         )
-        
-        return {
-            'llm': llm_client,
-            'retriever': retriever,
-            'embeddings': embeddings,
-            'bm25_encoder': bm25_encoder,
-            'index': index,
-            'bm25_path': bm25_path,
-            'status': 'healthy'
-        }
-    except Exception as e:
-        return {
-            'llm': None,
-            'retriever': None,
-            'embeddings': None,
-            'bm25_encoder': None,
-            'index': None,
-            'bm25_path': None,
-            'status': 'error',
-            'error': str(e)
-        }
 
-# Helper functions
-def extract_text_using_ocr(pdf_path):
-    """Extract text from PDF using OCR"""
-    try:
-        images = convert_from_path(pdf_path)
-        return "\n".join(clean_text(pytesseract.image_to_string(img)) for img in images)
+        return {"llm": llm_client, "retriever": retriever, "embeddings": embeddings,
+                "bm25_encoder": bm25_encoder, "index": index, "bm25_path": bm25_path,
+                "status": "healthy"}
     except Exception as e:
-        st.error(f"OCR extraction error: {e}")
-        return ""
+        return {"llm": None, "retriever": None, "embeddings": None, "bm25_encoder": None,
+                "index": None, "bm25_path": None, "status": "error", "error": str(e)}
 
-def clean_text(text):
-    """Clean and normalize text"""
+services = initialize_services()
+
+# -----------------------------
+# Utilities: OCR & chunking with metadata
+# -----------------------------
+def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
-def split_text_into_chunks(text, chunk_size=300):
-    """Split text into chunks for processing"""
-    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
-
-def prepare_rag_prompt(query, message_history=None, retriever=None, top_n=3):
-    """Prepare RAG prompt with context from retriever"""
-    if not retriever:
-        return f"Question: {query}\n\nI don't have access to my knowledge base right now. Please try again later."
-    
+def extract_text_pages(pdf_path: str, pdf_name: str) -> list:
+    """
+    OCR the PDF and return a list of dicts:
+    [{"page": 1, "text": "....", "pdf_name": "file.pdf"}, ...]
+    """
+    pages = []
     try:
-        top_docs = retriever.invoke(query)
-        top_contents = [doc.page_content for doc in top_docs[:top_n]]
-        
-        context_blocks = "\n\n".join(
-            [f"Context {i+1}:\n{content}" for i, content in enumerate(top_contents)]
-        )
+        images = convert_from_path(pdf_path)
+        for i, img in enumerate(images, start=1):
+            txt = clean_text(pytesseract.image_to_string(img))
+            if txt:
+                pages.append({"page": i, "text": txt, "pdf_name": pdf_name})
+        return pages
+    except Exception as e:
+        st.error(f"OCR extraction error: {e}")
+        return []
 
-        # Include recent chat history
-        history_text = ""
-        if message_history:
-            recent_history = message_history[-5:]  # Last 5 messages
-            for msg in recent_history:
-                role = "User" if msg["role"] == "user" else "Assistant"
-                history_text += f"{role}: {msg['content']}\n"
+def chunk_page_text(page_dict, chunk_size=800):
+    """
+    Create chunks from a page while preserving metadata for citation.
+    Returns texts[], metadatas[] aligned lists.
+    """
+    txt = page_dict["text"]
+    chunks = [txt[i:i+chunk_size] for i in range(0, len(txt), chunk_size) if txt[i:i+chunk_size].strip()]
+    texts = []
+    metas = []
+    for j, ch in enumerate(chunks):
+        texts.append(ch)
+        metas.append({
+            "pdf_name": page_dict.get("pdf_name"),
+            "page": page_dict.get("page"),
+            "chunk_id": j
+        })
+    return texts, metas
 
-        return f"""
+# -----------------------------
+# Retriever helpers
+# -----------------------------
+def get_contexts(query: str, retriever, top_n=3):
+    """
+    Return top_n Document-like objects from the retriever (with page_content and metadata).
+    """
+    try:
+        docs = retriever.invoke(query)
+        return docs[:top_n]
+    except Exception as e:
+        st.error(f"Retrieval error: {e}")
+        return []
+
+# -----------------------------
+# Prompt building: strict PDF-only instructions
+# -----------------------------
+def build_rag_prompt(query, message_history, docs):
+    history_text = ""
+    if message_history:
+        for msg in message_history[-5:]:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_text += f"{role}: {msg['content']}\n"
+
+    # Format context blocks with explicit citation markers
+    if docs:
+        ctx_blocks = []
+        for i, d in enumerate(docs, start=1):
+            meta = getattr(d, "metadata", {}) or {}
+            pdf = meta.get("pdf_name")
+            page = meta.get("page", "?")
+            ctx_blocks.append(f"[C{i}] {pdf} (p.{page})\n{d.page_content}")
+        context_blocks = "\n\n".join(ctx_blocks)
+    else:
+        context_blocks = "NO_RELEVANT_DOCUMENTS_FOUND"
+
+    prompt = f"""
 You are a knowledgeable medical assistant tasked with answering user queries clearly and accurately. You provide preventions and diet plans when requested.
 
 ### Chat History:
@@ -532,541 +623,541 @@ Question: {query}
 
 
 Guidelines:
-0) Instruction Hierarchy (in case of conflicts)
-
-Safety rules (emergency handling, controlled substances, legal/ethical).
-
-PDF-citations policy (cite only trained PDFs by name + page).
-
-Drug-information focus (don't over-ask unless personalization affects safety).
-
-Core behavior (greeting, info collection, personalization).
-
-Style & format (concise, clear, actionable).
-
-Fallback policy (strict PDF-only mode vs hybrid; configurable).
-
-1) Role & Scope
-
-Act as a medical information assistant specialized in drug information (uses, side effects, precautions, interactions, dosage ranges) and secondarily disease/procedure explanations.
-
-You are not a doctor; you give evidence-based information and safe guidance, not diagnoses or prescriptions.
-
-2) Greeting
-
-If user greets: reply warmly and only ask: "How may I help you? Do have any drug related pdf, please upload!"
-
-Do not ask for personal info at this stage.
-
-dont greet the user for every query.
-
-Do not greet if user query is medical or drug related or a general query.
-
-3) When to Ask Questions (Minimalist Policy)
-A) Drug-only queries (general info)
-
-If user asks "What is <drug>?", "Side effects of <drug>?", "What is it used for?"
-Answer directly. Do not ask age/weight/history.
-
-Include: uses, common side effects, serious side effects (red flags), precautions, contraindications, high-level dosage guidance (standard adult unless otherwise stated), interactions overview, storage, when to seek care think like a genAI and answer this.
-
-B) Personalized suitability or dosing
-
-If the user asks "Can I take <drug>?", "What dose should I take?", "Is it safe with my meds?" ,"I'm having <illness> what should i do?", "What is the diet plan for <illness>?", "What are the preventions for <illness>?" or similar:
-Ask only the minimum necessary to provide safe, personalized advice.
-Ask the following questions to personalize the answer:
-
-Age
-
-Gender
-
-If female ask about Pregnancy/breastfeeding status (if potentially relevant)
-
-Current conditions (esp. kidney/liver, heart disease, diabetes, glaucoma, GI issues)
-
-Current medications & supplements (including recent antibiotics/antifungals, MAOIs)
-
-Known allergies (especially to the drug/class)
-
-Weight only if pediatric or weight-based dosing (e.g., mg/kg)
-
-Ask nothing else unless strictly necessary for safety (e.g., eGFR when renal dosing adjustments are PDF-specified).
-
-C) Disease/procedure queries
-
-Ask age, gender, conditions, meds only if the user requests personalized advice.
-
-Otherwise provide general, educational information.
-
-4) Core Content Requirements
-
-For each answer, include—when relevant:
-
-Direct answer first (one-paragraph summary).
-
-Details (structured bullets):
-
-For drugs:
-
-Uses/indications (on-label; state off-label only if present in PDFs).
-
-Dosage: typical adult dose; pediatric mg/kg when applicable; max dose; routes; frequency; duration if applicable.
-
-Adjustments: renal/hepatic dose changes (include thresholds if PDFs specify: e.g., CrCl/eGFR cutoffs; Child-Pugh).
-
-Contraindications (absolute vs relative if PDFs distinguish).
-
-Warnings/Black-box: call out clearly if present in PDFs.
-
-Common side effects vs serious side effects (red-flag symptoms → stop and seek care).
-
-Drug interactions: major classes and notable pairs; timing (e.g., antacids, MAOIs, SSRIs, grapefruit).
-
-Special populations: pregnancy, lactation, geriatrics, pediatrics (age cutoffs).
-
-Monitoring: what to watch (BP, HR, INR, LFTs, renal function) if applicable.
-
-Administration: with/without food, time of day, do not crush/chew, storage.
-
-For diseases: symptoms, causes, differentials (optional), evaluation overview, treatments (lifestyle, OTC, Rx categories), prevention.
-
-For procedures: what it is, preparation, steps (plain language), risks, benefits, recovery, alternatives.
-
-Actionable next steps (simple to follow).
-
-Disclaimer (only when you mention medication use, dosing, diagnosis, or urgent concerns).
-
-PDF citations (see Section 6).
-
-5) Safety Guardrails (Hard Rules)
-
-Emergencies (e.g., chest pain, stroke signs, anaphylaxis, severe breathing trouble, suicidal ideation, overdose):
-→ "This seems urgent. Please seek emergency medical help immediately by calling your local emergency number."
-
-Controlled substances / illegal requests: Do not help procure, dose, or optimize misuse. You may give high-level safety info (e.g., dependence risk) but refuse prescribing/obtaining help.
-
-Pediatric dosing: If age/weight missing for weight-based drugs, do not provide a personal dose. Provide general pediatric framework and ask for the needed info.
-
-Pregnancy/Lactation: If advice depends on status and it's unknown, highlight that status matters and provide general safety info only; suggest clinician confirmation.
-
-Renal/Hepatic impairment: If PDFs specify thresholds (e.g., eGFR <30), do not personalize without that info; either ask or present general caution.
-
-Do not diagnose; present information and recommend seeing a clinician for diagnosis/treatment decisions.
-
-No definitive treatment plans for serious conditions; provide categories/options and urge clinician involvement.
-
-No speculation beyond PDFs (for facts requiring citation). See fallback policy.
-
-6) Citations & Plagiarism (PDF-Only)
-
-Cite only the PDF(s) used to generate the answer. Format:
-
-(PDF_Name.pdf, p. XX) or (PDF_Name.pdf) if no page.
-
-If multiple PDFs contributed: list all, separated by semicolons.
-
-Never cite websites or generic sources in responses.
-
-Plagiarism control: paraphrase; if quoting, keep to ≤25 words and add quotes plus page citation.
-
-If no relevant PDF content exists:
-
-Strict PDF-only mode (recommended for compliance): say
-"I don't find this in the provided PDFs. I can share general educational info if you allow responses without PDF citations."
-
-Hybrid mode (if you enable it): provide clearly marked general info without citation (or with a generic note "No matching PDF source found"). Choose one mode for your deployment.
-
-7) Dosage Rules (to reduce errors)
-
-Show standard units (mg, mcg, g, mL). Convert lb→kg internally (1 kg = 2.20462 lb) before mg/kg math.
-
-Always state maximum daily dose if PDFs contain it.
-
-Round pediatric doses as PDFs direct (e.g., to nearest 2.5 mg or mL). If not specified, round conservatively and note "rounded per typical practice."
-
-Time-based dosing: specify interval (q4–6h), duration (e.g., 3–5 days), and do not exceed statement if in PDFs.
-
-Adjustments: if PDFs include renal/hepatic guidance, include explicit thresholds and example adjusted doses.
-
-Calculation hygiene: (internal) compute step-by-step; (external) optionally include a brief "Calculation" line when helpful, especially pediatric mg/kg.
-
-8) Follow-Up Question Triggers
-
-Ask only when these change safety/dosing:
-
-Pediatric dosing → age & weight.
-
-Pregnancy/lactation → if drug has fetal/neonatal risk.
-
-Renal/hepatic impairment mentioned or suspected from context.
-
-High-risk interactions likely (e.g., MAOIs, warfarin, linezolid, tramadol + SSRIs).
-
-Prior severe allergy/anaphylaxis to same drug/class.
-
-9) Refusals (with redirect)
-
-Refuse to help with: forging prescriptions, sourcing controlled substances, unsafe combinations for self-harm, detailed "how to misuse" instructions.
-
-Redirect to: general safety info, support resources, clinician evaluation, or emergency services.
-
-10) Output Format (Consistent, Parse-friendly)
-
-Default human-readable format; optionally pair with JSON (below).
-
-Answer layout:
-
-Summary (2–3 sentences).
-
-Details (sectioned bullets per content requirements).
-
-What to do next (numbered steps).
-
-Disclaimer (only when needed).
-
-Citations: (PDF_Name.pdf, p. X; Other_PDF.pdf, p. Y) on a single line.
-
-
-
-""".strip()
-    except Exception as e:
-        st.error(f"RAG preparation error: {e}")
-        return f"Question: {query}\n\nI'm having trouble accessing my knowledge base. Please try again."
-
-def get_llm_response(query, message_history=None, services=None):
-    """Get response from LLM with RAG context"""
-    if not services or not services['llm']:
-        return "I'm sorry, but the AI service is currently unavailable. Please try again later."
-    
+- If the user greatss you, greet them back politely. do not add any citations for greeting . dont add any sources to the responce too.
+- Always base your answers strictly on the provided context. Do not use any external knowledge or make assumptions.
+- Do not greet for every question asked. Greet only if the user greets you first.
+- Never fabricate or guess answers. If the information is not in the context, say you don't know.
+- Never start a resonse with "As an AI language model".
+- Never provide medical advice beyond general information. Always recommend consulting a healthcare professional for specific concerns.
+- If the user asks for a summary of the documents, provide a brief overview without citations.
+- If the context contains "NO_RELEVANT_DOCUMENTS_FOUND", respond with: "I couldn't find this information in the uploaded documents."
+- If the answer is not contained within the provided context, respond with: "I'm sorry, I don't have that information in the uploaded documents."
+- EXAMPLE FORMAT FOR GREETING:
+User: Hello
+Assistant: Hello! How can I assist you today?
+
+1. Standard Structure
+- Every drug/condition response should follow the same clear sections:
+- Drug Summary / Overview – short description (name, class, purpose).
+- Usage / Indications – what it’s used for.
+- Dosage & Administration
+- Adult dose
+- Pediatric dose
+- Route (PO/IV/other)
+- Frequency
+- Maximum dose (if applicable)
+- Precautions / Safety Notes – contraindications, warnings, interactions (keep brief).
+- What to Do Next – simple actionable advice (e.g., consult doctor, when to seek care).
+- Disclaimer – always include a safety disclaimer.
+- Citations – structured reference to source(s).
+
+2. Tone & Language
+- Clear, concise, non-technical (layman-friendly).
+- Avoid jargon unless needed; explain medical terms briefly.
+- Neutral and professional — never give direct prescriptions, only general information.
+
+3. Safety First
+
+- Never give exact personalized medical advice (like “you should take X now”).
+- Always include disclaimer: “This information is for educational purposes only and not a substitute for professional medical advice.”
+- Encourage users to consult a healthcare professional.
+
+4. Consistency Rules
+
+- Always use SI units (mg, g, mL).
+- Show frequency as q4–6h, q12h etc.
+- Specify adult vs pediatric doses separately.
+- State routes (PO, IV, IM, etc.) clearly.
+
+5. Citation Guidelines
+
+- Always include at least one citation (real or placeholder).
+- Citation should the pdf name
+
+6. Response Length
+
+- Keep Summary short (2–3 lines).
+- Use bullet points for clarity.
+- Avoid long paragraphs unless needed for explanation.
+
+EXAMPLE RESPONSE FORMAT:
+Summary
+Paracetamol (Acetaminophen) is an analgesic and antipyretic used to reduce fever and mild to moderate pain.
+
+Usage / Indications
+- Fever
+- Mild to moderate pain
+
+Dosage & Administration
+- Adult: 500–1000 mg PO/IV q4–6h (max 4 g/day)
+- Pediatric: 10–15 mg/kg PO/IV q4–6h (max per guideline)
+
+Precautions / Safety
+- Avoid in severe liver disease
+- Use with caution with alcohol or hepatotoxic drugs
+
+What To Do Next
+Paracetamol may be considered as directed. Always consult a doctor before use.
+
+Disclaimer
+This information is for educational purposes only and not medical advice. Always consult a healthcare professional.
+
+Citations
+- Source: WHO Guidelines, p. 24
+
+
+### Chat history:
+{history_text}
+
+### Knowledge Base Context:
+{context_blocks}
+
+### Question:
+{query}
+
+Answer only using the context above.
+"""
+    return prompt.strip()
+
+# -----------------------------
+# LLM call helper
+# -----------------------------
+def llm_chat(client, model, prompt, temperature=0.0, max_tokens=1200):
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content
+
+# -----------------------------
+# Deterministic sources output (from retrieved docs metadata)
+# -----------------------------
+def format_sources_from_docs(docs):
+    seen = set()
+    items = []
+    for d in docs:
+        meta = getattr(d, "metadata", {}) or {}
+        pdf = meta.get("pdf_name")
+        page = meta.get("page", "?")
+        key = (pdf, page)
+        if key not in seen:
+            seen.add(key)
+            items.append(f"{pdf}, p. {page}")
+    return items
+
+# -----------------------------
+# LLM-as-Judge (optional, kept from your pipeline)
+# -----------------------------
+def judge_score(client, model, question, answer, contexts, dimension: str):
+    ctx_joined = "\n\n".join([c.page_content for c in contexts]) if contexts else "NO_CONTEXT"
+    rubric = {
+        "faithfulness": "Score 1.0 if the answer is fully supported by the context, 0.0 if it contradicts or invents facts; scale smoothly otherwise.",
+        "answer_relevancy": "Score 1.0 if the answer fully addresses the user's question, 0.0 if irrelevant; scale if partial.",
+        "context_relevancy": "Score 1.0 if the retrieved context is relevant and useful to answer the question, 0.0 if irrelevant; scale if partially relevant."
+    }[dimension]
+
+    prompt = f"""
+You are an impartial evaluator for a Retrieval-Augmented Generation system.
+
+Dimension to score: {dimension}
+Rubric: {rubric}
+
+Question:
+{question}
+
+Answer:
+{answer}
+
+Retrieved Context:
+{ctx_joined}
+
+Return ONLY a JSON object like:
+{{"score": 0.0, "reason": "brief reason"}}
+"""
     try:
-        rag_prompt = prepare_rag_prompt(query, message_history, services['retriever'])
-        
-        response = services['llm'].chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[{"role": "user", "content": rag_prompt}],
-            max_tokens=3000,
-            temperature=0.8,
-        )
-        
-        return response.choices[0].message.content
+        out = llm_chat(client, model, prompt, temperature=0.0, max_tokens=200)
+        m = re.search(r"\{.*\}", out, flags=re.DOTALL)
+        data = json.loads(m.group(0)) if m else {"score": None, "reason": "parse_error"}
+        score = data.get("score", None)
+        if isinstance(score, (int, float)):
+            score = max(0.0, min(1.0, float(score)))
+        else:
+            score = None
+        return score, data.get("reason", "")
     except Exception as e:
-        st.error(f"LLM response error: {e}")
-        return "I apologize, but I encountered an error while processing your request. Please try again or contact support if the issue persists."
+        return None, f"judge_error: {e}"
 
-# Initialize services
-services = initialize_services()
+def evaluate_realtime(client, model, question, answer, contexts):
+    start = time.time()
+    f_score, f_reason = judge_score(client, model, question, answer, contexts, "faithfulness")
+    a_score, a_reason = judge_score(client, model, question, answer, contexts, "answer_relevancy")
+    c_score, c_reason = judge_score(client, model, question, answer, contexts, "context_relevancy")
+    latency = time.time() - start
+    return {"faithfulness": f_score, "answer_relevancy": a_score, "context_relevancy": c_score,
+            "latency_sec": latency, "reasons": {"faithfulness": f_reason, "answer_relevancy": a_reason, "context_relevancy": c_reason}}
 
-# Initialize session state
+# -----------------------------
+# Session state initialization
+# -----------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "logs" not in st.session_state:
+    st.session_state.logs = []
 if "upload_status" not in st.session_state:
     st.session_state.upload_status = ""
+if "last_answer_idx" not in st.session_state:
+    st.session_state.last_answer_idx = None
+if "feedback" not in st.session_state:
+    st.session_state.feedback = [] 
 
+def render_chat_message(role, content, index, query=None):
+    with st.chat_message(role):
+        st.markdown(content)
+
+        # Only show feedback for assistant messages
+        if role == "assistant":
+            col1, col2 = st.columns([0.15, 0.15])
+            with col1:
+                if st.button("👍", key=f"up_{index}"):
+                    st.session_state["feedback"].append({
+                        "query": query,
+                        "response": content,
+                        "feedback": "up",
+                        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    st.success("Thanks for your feedback!")
+            with col2:
+                if st.button("👎", key=f"down_{index}"):
+                    st.session_state["feedback"].append({
+                        "query": query,
+                        "response": content,
+                        "feedback": "down",
+                        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    st.warning("Feedback noted!")
+
+# -----------------------------
 # App header
+# -----------------------------
 st.markdown("""
 <div class="app-header">
-    <h1> MediRAG - AI Medical Assistant</h1>
+    <h1>MediRAG - AI Medical Assistant</h1>
     <div class="subtitle">Your intelligent medical information companion</div>
 </div>
 """, unsafe_allow_html=True)
 
-# Main layout
-col_main, col_sidebar = st.columns([3, 1])
+# -----------------------------
+# Tabs: Chat + Metrics
+# -----------------------------
+tab_chat, tab_metrics = st.tabs(["Chat", "Metrics Dashboard"])
 
-with col_main:
-    # Chat container
-    chat_container = st.container()
-    
-    with chat_container:
-        # Display welcome message if no conversation
-        if not st.session_state.messages:
-            st.markdown("""
-            <div class="welcome-message">
-                <div class="welcome-content">
-                    <h2> Welcome to MediRAG</h2>
-                    <p>I'm your AI-powered medical assistant. Upload PDFs for personalized responses.</p>
-                    <div class="feature-cards">
-                        <div class="feature-card">
-                            <h4> Drug Information</h4>
-                            <p>Medication details, dosages, interactions.</p>
-                        </div>
-                        <div class="feature-card">
-                            <h4> Health Guidance</h4>
-                            <p>Evidence-based health advice.</p>
-                        </div>
-                        <div class="feature-card">
-                            <h4> PDF Analysis</h4>
-                            <p>Personalized insights from uploaded medical PDFs.</p>
+# -----------------------------
+# CHAT TAB
+# -----------------------------
+with tab_chat:
+    col_main, col_sidebar = st.columns([3, 1])
+
+    with col_main:
+        chat_container = st.container()
+        with chat_container:
+            if not st.session_state.messages:
+                st.markdown("""
+                <div class="welcome-message">
+                    <div class="welcome-content">
+                        <h2> Welcome to MediRAG</h2>
+                        <p>I'm your AI-powered medical assistant. Upload PDFs for personalized responses.</p>
+                        <div class="feature-cards">
+                            <div class="feature-card">
+                                <h4> Drug Information</h4>
+                                <p>Medication details, dosages, interactions.</p>
+                            </div>
+                            <div class="feature-card">
+                                <h4> Health Guidance</h4>
+                                <p>Evidence-based health advice.</p>
+                            </div>
+                            <div class="feature-card">
+                                <h4> PDF Analysis</h4>
+                                <p>Personalized insights from uploaded medical PDFs.</p>
+                            </div>
                         </div>
                     </div>
                 </div>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            # Display chat messages
-            for i, message in enumerate(st.session_state.messages):
-                if message["role"] == "user":
-                    st.markdown(f"""
-                    <div class="message-row user-message-row">
-                        <div class="message-content">
-                            <div class="message-avatar user-avatar">U</div>
-                            <div class="message-text">
-                                <p>{message["content"]}</p>
+                """, unsafe_allow_html=True)
+            else:
+                for i, m in enumerate(st.session_state.messages):
+                    if m["role"] == "user":
+                        st.markdown(f"""
+                        <div class="message-row user-message-row">
+                            <div class="message-content">
+                                <div class="message-avatar user-avatar">User</div>
+                                <div class="message-text"><p>{m["content"]}</p></div>
                             </div>
                         </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    formatted_content = message["content"].replace('**', '').replace('*', '').replace('\n\n', '</p><p>').replace('\n', '<br>')
-                    if not formatted_content.startswith('<p>'):
-                        formatted_content = f'<p>{formatted_content}</p>'
-                    
-                    st.markdown(f"""
-                    <div class="message-row bot-message-row">
-                        <div class="message-content">
-                            <div class="message-avatar bot-avatar">AI</div>
-                            <div class="message-text">
-                                {formatted_content}
+                        """, unsafe_allow_html=True)
+                    else:
+                        formatted = m["content"].replace('\n\n', '</p><p>').replace('\n', '<br>')
+                        if not formatted.startswith('<p>'):
+                            formatted = f'<p>{formatted}</p>'
+                        st.markdown(f"""
+                        <div class="message-row bot-message-row">
+                            <div class="message-content">
+                                <div class="message-avatar bot-avatar">AI</div>
+                                <div class="message-text">{formatted}</div>
                             </div>
                         </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                        """, unsafe_allow_html=True)
+                        col1, col2 = st.columns([0.1, 0.1])
+                        with col1:
+                            if st.button("Is the responce relavent 👍", key=f"up_{i}"):
+                                st.session_state.feedback.append({
+                                        "index": i,
+                                        "response": m["content"],
+                                        "feedback": "The response is relevant"
+                                    })
+                                    # 🔥 Update logs + save to CSV
+                                if st.session_state.get("logs"):
+                                        st.session_state.logs[-1]["feedback"] = "Relevant response was provided"
+                                        pd.DataFrame(st.session_state.logs).to_csv("logs/metrics.csv", index=False)
 
-    # Input area - Fixed at bottom
-    input_container = st.container()
-    
-    # Create a custom input area that stays fixed
-    st.markdown("""
-    <div class="chat-input-container">
-        <div class="input-wrapper">
-            <div style="flex: 1;">
-                <div id="chat-input-placeholder"></div>
+                        with col2:
+                            if st.button("Bad response👎", key=f"down_{i}"):
+                                st.session_state.feedback.append({
+                                        "index": i,
+                                        "response": m["content"],
+                                        "feedback": "The response is not relevant"
+                                    })
+                                    # 🔥 Update logs + save to CSV
+                                if st.session_state.get("logs"):
+                                    st.session_state.logs[-1]["feedback"] = "Irrelevant response was provided"
+                                    pd.DataFrame(st.session_state.logs).to_csv("logs/metrics.csv", index=False)
+
+
+        # Fixed chat input
+        st.markdown("""
+        <div class="chat-input-container">
+            <div class="input-wrapper"><div style="flex:1;"><div id="chat-input-placeholder"></div></div></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.form(key="chat_form", clear_on_submit=True):
+            user_input = st.text_input("Message", placeholder="Ask about the uploaded PDFs...", label_visibility="collapsed", key="message_input")
+            submit_button = st.form_submit_button("Send", type="primary")
+
+            st.markdown("""
+            <script>
+            // small JS - clone input into fixed area (kept from your original)
+            document.addEventListener('DOMContentLoaded', function() {
+                const input = document.querySelector('[data-testid="stTextInput"] input');
+                const placeholder = document.getElementById('chat-input-placeholder');
+                const form = document.querySelector('[data-testid="stForm"]');
+                const submitButton = document.querySelector('[data-testid="stForm"] button[kind="primaryFormSubmit"]');
+                if (input && placeholder) {
+                    const inputClone = input.cloneNode(true);
+                    inputClone.style.background='transparent'; inputClone.style.border='none'; inputClone.style.color='#ececf1';
+                    inputClone.style.fontSize='1rem'; inputClone.style.outline='none'; inputClone.style.width='100%'; inputClone.style.padding='.5rem 0';
+                    placeholder.appendChild(inputClone);
+                    const sendBtn = document.createElement('button'); sendBtn.innerHTML='➤';
+                    sendBtn.style.background='#19c37d'; sendBtn.style.border='none'; sendBtn.style.borderRadius='6px';
+                    sendBtn.style.width='32px'; sendBtn.style.height='32px'; sendBtn.style.color='white'; sendBtn.style.cursor='pointer';
+                    placeholder.parentElement.appendChild(sendBtn);
+                    inputClone.addEventListener('input', function(){ input.value=this.value; input.dispatchEvent(new Event('input',{bubbles:true})); });
+                    input.addEventListener('input', function(){ inputClone.value=this.value; });
+                    inputClone.addEventListener('keydown', function(e){ if (e.key==='Enter'){ e.preventDefault(); if (this.value.trim()){ input.value=this.value; input.dispatchEvent(new Event('input',{bubbles:true})); submitButton.click(); } }});
+                    sendBtn.addEventListener('click', function(e){ e.preventDefault(); if (inputClone.value.trim()){ input.value=inputClone.value; input.dispatchEvent(new Event('input',{bubbles:true})); submitButton.click(); }});
+                    if (form) { form.style.display='none'; }
+                    inputClone.focus();
+                }
+            });
+            </script>
+            """, unsafe_allow_html=True)
+
+            if submit_button and user_input.strip():
+                st.session_state.messages.append({"role": "user", "content": user_input.strip()})
+                with st.spinner("Analyzing your question..."):
+                    try:
+                        if services["status"] != "healthy":
+                            raise RuntimeError(services.get("error", "Service unavailable"))
+
+                        # Retrieve contexts (documents with metadata)
+                        contexts = get_contexts(user_input.strip(), services["retriever"], top_n=4)
+
+                        # Build prompt that forces PDF-only answers
+                        rag_prompt = build_rag_prompt(user_input.strip(), st.session_state.messages, contexts)
+
+                        # Call generator model
+                        start_gen = time.time()
+                        answer = llm_chat(services["llm"], GEN_MODEL, rag_prompt, temperature=0.0, max_tokens=1200)
+                        gen_latency = time.time() - start_gen
+
+                        # If the LLM replied with the abstain phrase or contexts empty, enforce abstain
+                        if not contexts:
+                            final_answer = "I couldn't find this information in the uploaded documents."
+                            used_contexts = []
+                        else:
+                            # To be safe: if LLM used outside knowledge, judge or simple heuristic could detect.
+                            # But we will respect LLM output except when it clearly says it couldn't find.
+                            # Build deterministic sources list from retrieved contexts
+                            sources = format_sources_from_docs(contexts)
+                            if "I couldn't find" in answer or "couldn't find" in answer.lower():
+                                final_answer = "I couldn't find this information in the uploaded documents."
+                                used_contexts = []
+                            else:
+                                # append Sources block deterministically (not trusting LLM for citation)
+                                source_text = "\n".join(f"- {s}" for s in sources) if sources else ""
+                                final_answer = answer
+                                used_contexts = contexts
+
+                        # Append assistant message
+                        st.session_state.messages.append({"role": "assistant", "content": final_answer})
+                        st.session_state.last_answer_idx = len(st.session_state.messages) - 1
+
+                        # Evaluate using judge model (optional)
+                        metrics = evaluate_realtime(services["llm"], JUDGE_MODEL, user_input.strip(), final_answer, used_contexts) if services["llm"] else {"faithfulness": None, "answer_relevancy": None, "context_relevancy": None, "latency_sec": None, "reasons": {}}
+
+                        # Persist log entry
+                        log_entry = {
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "question": user_input.strip(),
+                            "answer": final_answer,
+                            "faithfulness": metrics.get("faithfulness"),
+                            "answer_relevancy": metrics.get("answer_relevancy"),
+                            "context_relevancy": metrics.get("context_relevancy"),
+                            "gen_latency_sec": round(gen_latency, 3),
+                            "eval_latency_sec": round(metrics.get("latency_sec", 0), 3) if metrics.get("latency_sec") else None,
+                            "judge_reasons": json.dumps(metrics.get("reasons", {})),
+                            "feedback": None,
+                        }
+                        st.session_state.logs.append(log_entry)
+
+                        # Save logs persistently
+                        os.makedirs("logs", exist_ok=True)
+                        pd.DataFrame(st.session_state.logs).to_csv("logs/metrics.csv", index=False)
+
+                    except Exception as e:
+                        st.session_state.messages.append({"role": "assistant", "content": "I encountered an error while processing your request."})
+                st.rerun()
+
+    # Sidebar: PDF upload + services health
+    with col_sidebar:
+        st.markdown("""
+        <div class="sidebar-content">
+            <div class="upload-section">
+                <h4> Upload Medical PDF</h4>
+                <p>Upload PDF documents. The assistant will answer using only uploaded PDFs and show sources (file + page).</p>
             </div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Chat input form
-    with st.form(key="chat_form", clear_on_submit=True):
-        user_input = st.text_input(
-            "Message",
-            placeholder="Ask me anything about medicine, health, or upload a PDF for personalized responses...",
-            label_visibility="collapsed",
-            key="message_input"
-        )
-        
-        # Hidden submit button (we'll trigger it with JavaScript)
-        submit_button = st.form_submit_button("Send", type="primary")
-        
-        # JavaScript to handle Enter key and move input to fixed position
-        st.markdown("""
-        <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            const input = document.querySelector('[data-testid="stTextInput"] input');
-            const placeholder = document.getElementById('chat-input-placeholder');
-            const form = document.querySelector('[data-testid="stForm"]');
-            const submitButton = document.querySelector('[data-testid="stForm"] button[kind="primaryFormSubmit"]');
-            
-            if (input && placeholder) {
-                // Move input to fixed position
-                const inputClone = input.cloneNode(true);
-                inputClone.style.background = 'transparent';
-                inputClone.style.border = 'none';
-                inputClone.style.color = '#ececf1';
-                inputClone.style.fontSize = '1rem';
-                inputClone.style.outline = 'none';
-                inputClone.style.width = '100%';
-                inputClone.style.padding = '0.5rem 0';
-                
-                placeholder.appendChild(inputClone);
-                
-                // Add send button to fixed input
-                const sendBtn = document.createElement('button');
-                sendBtn.innerHTML = '➤';
-                sendBtn.style.background = '#19c37d';
-                sendBtn.style.border = 'none';
-                sendBtn.style.borderRadius = '6px';
-                sendBtn.style.width = '32px';
-                sendBtn.style.height = '32px';
-                sendBtn.style.color = 'white';
-                sendBtn.style.cursor = 'pointer';
-                sendBtn.style.display = 'flex';
-                sendBtn.style.alignItems = 'center';
-                sendBtn.style.justifyContent = 'center';
-                sendBtn.style.flexShrink = '0';
-                sendBtn.style.transition = 'all 0.2s';
-                
-                sendBtn.addEventListener('mouseenter', function() {
-                    this.style.background = '#10a37f';
-                });
-                sendBtn.addEventListener('mouseleave', function() {
-                    this.style.background = '#19c37d';
-                });
-                
-                placeholder.parentElement.appendChild(sendBtn);
-                
-                // Sync input values
-                inputClone.addEventListener('input', function() {
-                    input.value = this.value;
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                });
-                
-                input.addEventListener('input', function() {
-                    inputClone.value = this.value;
-                });
-                
-                // Handle Enter key to send message
-                inputClone.addEventListener('keydown', function(e) {
-                    if (e.key === 'Enter') {
-                        e.preventDefault();
-                        if (this.value.trim()) {
-                            input.value = this.value;
-                            input.dispatchEvent(new Event('input', { bubbles: true }));
-                            submitButton.click();
-                        }
-                    }
-                });
-                
-                // Handle send button click
-                sendBtn.addEventListener('click', function(e) {
-                    e.preventDefault();
-                    if (inputClone.value.trim()) {
-                        input.value = inputClone.value;
-                        input.dispatchEvent(new Event('input', { bubbles: true }));
-                        submitButton.click();
-                    }
-                });
-                
-                // Hide original form
-                if (form) {
-                    form.style.display = 'none';
-                }
-                
-                // Focus on the cloned input
-                inputClone.focus();
-            }
-        });
-        </script>
         """, unsafe_allow_html=True)
-        
-        if submit_button and user_input.strip():
-            # Add user message
-            st.session_state.messages.append({"role": "user", "content": user_input.strip()})
-            
-            # Generate response
-            with st.spinner(" Analyzing your question..."):
+
+        uploaded_file = st.file_uploader("Choose a PDF file", type=['pdf'], help="Upload medical PDFs", label_visibility="collapsed")
+
+        if uploaded_file is not None:
+            with st.spinner("Processing your PDF..."):
                 try:
-                    response = get_llm_response(user_input.strip(), st.session_state.messages, services)
-                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                        tmp_file.write(uploaded_file.read())
+                        pdf_path = tmp_file.name
+
+                    pdf_name = uploaded_file.name
+                    pages = extract_text_pages(pdf_path, pdf_name)
+
+                    if not pages:
+                        st.markdown('<div class="status-message error-message">No text could be extracted from PDF</div>', unsafe_allow_html=True)
+                    else:
+                        all_texts, all_metas = [], []
+                        for p in pages:
+                            texts, metas = chunk_page_text(p, chunk_size=800)
+                            all_texts.extend(texts)
+                            all_metas.extend(metas)
+
+                        if services['status'] == 'healthy':
+                            # fit BM25 and re-create retriever (keeps index same but uses new sparse encoder)
+                            services['bm25_encoder'].fit(all_texts)
+                            services['bm25_encoder'].dump(services['bm25_path'])
+
+                            services['retriever'] = PineconeHybridSearchRetriever(
+                                embeddings=services['embeddings'],
+                                sparse_encoder=services['bm25_encoder'],
+                                index=services['index']
+                            )
+
+                            # Add texts to the index with metadata so we can cite file+page
+                            # retriever.add_texts should accept (texts, metadatas)
+                            services['retriever'].add_texts(texts=all_texts, metadatas=all_metas)
+
+                            st.markdown('<div class="status-message success-message">PDF processed and indexed successfully!</div>', unsafe_allow_html=True)
+                        else:
+                            st.markdown('<div class="status-message error-message">Service unavailable for PDF processing</div>', unsafe_allow_html=True)
+
+                    os.unlink(pdf_path)
                 except Exception as e:
-                    error_msg = "I apologize, but I encountered an error while processing your request. Please try again or upload a relevant PDF for better assistance."
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
-            
+                    st.markdown(f'<div class="status-message error-message">Error processing PDF: {e}</div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+        if st.button("Clear Chat", use_container_width=True):
+            st.session_state.messages = []
+            st.session_state.last_answer_idx = None
             st.rerun()
 
-# Sidebar
-with col_sidebar:
-    st.markdown("""
-    <div class="sidebar-content">
-        <div class="upload-section">
-            <h4> Upload Medical PDF</h4>
-            <p>Upload medical documents, drug information, or research papers.</p>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # File uploader
-    uploaded_file = st.file_uploader(
-        "Choose a PDF file",
-        type=['pdf'],
-        help="Upload medical PDFs to enhance the AI's knowledge base",
-        label_visibility="collapsed"
-    )
-    
-    if uploaded_file is not None:
-        with st.spinner(" Processing your PDF..."):
-            try:
-                # Save uploaded file temporarily
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                    tmp_file.write(uploaded_file.read())
-                    pdf_path = tmp_file.name
-                
-                # Extract text
-                extracted_text = extract_text_using_ocr(pdf_path)
-                
-                if not extracted_text.strip():
-                    st.markdown('<div class="status-message error-message"> No text could be extracted from PDF</div>', unsafe_allow_html=True)
-                else:
-                    # Process text
-                    chunks = split_text_into_chunks(extracted_text)
-                    
-                    # Update BM25 encoder and retriever
-                    if services['status'] == 'healthy':
-                        services['bm25_encoder'].fit(chunks)
-                        services['bm25_encoder'].dump(services['bm25_path'])
-                        
-                        # Update retriever
-                        services['retriever'] = PineconeHybridSearchRetriever(
-                            embeddings=services['embeddings'],
-                            sparse_encoder=services['bm25_encoder'],
-                            index=services['index']
-                        )
-                        services['retriever'].add_texts(chunks)
-                        
-                        st.markdown('<div class="status-message success-message"> PDF processed successfully!</div>', unsafe_allow_html=True)
-                    else:
-                        st.markdown('<div class="status-message error-message">Service unavailable for PDF processing</div>', unsafe_allow_html=True)
-                
-                # Clean up
-                os.unlink(pdf_path)
-                
-            except Exception as e:
-                st.markdown('<div class="status-message error-message"> Error processing PDF</div>', unsafe_allow_html=True)
-    
-    # Clear chat button
-    st.markdown("---")
-    if st.button(" Clear Chat", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
-    
-    # Health status
-    st.markdown("---")
-    if services['status'] == 'healthy':
-        st.markdown("""
-        <div class="health-indicator">
-            <div class="health-dot health-healthy"></div>
-            <div class="health-text">All services online</div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="health-indicator">
-            <div class="health-dot health-error"></div>
-            <div class="health-text">Service issues detected</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Additional info
-    st.markdown("---")
-    with st.expander(" About MediRAG"):
-        st.markdown("""
-        **MediRAG** is an AI-powered medical assistant that provides:
-        
-        -  Drug information and interactions
-        -  Health guidance and advice
-        -  PDF document analysis
-        -  Evidence-based medical information
-        
-        **Disclaimer:** This tool provides information only and should not replace professional medical advice.
-        """)
+        st.markdown("---")
+        if services.get('status') == 'healthy':
+            st.markdown("""<div class="health-indicator"><div class="health-dot health-healthy"></div><div class="health-text">All services online</div></div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(f"""<div class="health-indicator"><div class="health-dot health-error"></div><div class="health-text">Service issues: {services.get('error')}</div></div>""", unsafe_allow_html=True)
 
-# Auto-scroll to bottom when new messages are added
-if st.session_state.messages:
-    st.markdown("""
-    <script>
-    var chatContainer = document.querySelector('.chat-container');
-    if (chatContainer) {
-        chatContainer.scrollTop = chatContainer.scrollHeight;
-    }
-    </script>
-    """, unsafe_allow_html=True)
+# -----------------------------
+# METRICS DASHBOARD TAB
+# -----------------------------
+with tab_metrics:
+    st.title("📊 RAG Evaluation Dashboard")
+
+    os.makedirs("logs", exist_ok=True)
+    csv_path = "logs/metrics.csv"
+    if os.path.exists(csv_path):
+        try:
+            df_file = pd.read_csv(csv_path)
+            if st.session_state.logs:
+                df_mem = pd.DataFrame(st.session_state.logs)
+                df = pd.concat([df_file, df_mem]).drop_duplicates(subset=["time", "question"], keep="last")
+            else:
+                df = df_file
+        except Exception:
+            df = pd.DataFrame(st.session_state.logs)
+    else:
+        df = pd.DataFrame(st.session_state.logs)
+
+    if df.empty:
+        st.info("No evaluation data yet. Start chatting to generate metrics.")
+    else:
+        for col in ["faithfulness", "answer_relevancy", "context_relevancy", "gen_latency_sec", "eval_latency_sec"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        st.write("### Recent Interactions")
+        show_cols = ["time", "question", "faithfulness", "answer_relevancy", "context_relevancy", "gen_latency_sec", "eval_latency_sec", "feedback"]
+        st.dataframe(df[show_cols].tail(15), use_container_width=True)
+
+        st.write("### Trends")
+        if {"faithfulness","answer_relevancy","context_relevancy"}.issubset(df.columns):
+            st.line_chart(df[["faithfulness", "answer_relevancy", "context_relevancy"]])
+
+        st.write("### Averages")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Faithfulness (avg)", f"{df['faithfulness'].mean():.2f}" if "faithfulness" in df else "—")
+        col2.metric("Answer Relevancy (avg)", f"{df['answer_relevancy'].mean():.2f}" if "answer_relevancy" in df else "—")
+        col3.metric("Context Relevancy (avg)", f"{df['context_relevancy'].mean():.2f}" if "context_relevancy" in df else "—")
+        if "gen_latency_sec" in df:
+            col4.metric("Gen Latency (avg s)", f"{df['gen_latency_sec'].mean():.2f}")
+        else:
+            col4.metric("Gen Latency (avg s)", "—")
+
+        st.write("### Judge Reasons (last 5)")
+        if "judge_reasons" in df:
+            for _, row in df.tail(5).iterrows():
+                with st.expander(f"{row.get('time','')} — {row.get('question','')[:60]}"):
+                    try:
+                        reasons = json.loads(row.get("judge_reasons","{}"))
+                    except Exception:
+                        reasons = {"raw": row.get("judge_reasons")}
+                    st.json(reasons)
