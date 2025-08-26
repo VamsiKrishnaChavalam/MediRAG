@@ -481,11 +481,11 @@ def get_secret(name, default=None):
 
 # You can set these values using environment variables or .streamlit/secrets.toml.
 # Example env var names: LLM_API_KEY, PINECONE_API_KEY, PINECONE_INDEX_NAME, HF_TOKEN
-LLM_API_KEY = "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"
-PINECONE_API_KEY = "pcsk_bGiUC_6wqctEnz2zymTRVFs7dKzhF5xQGnMwsQh8fnwqNAmKpNBntzAwFeL4WmoDiDFJc"
+LLM_API_KEY = "your api key "
+PINECONE_API_KEY = "your pinecone db key"
 
-PINECONE_INDEX_NAME = "medirag"
-HF_TOKEN = "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"
+PINECONE_INDEX_NAME = "pine cone index"
+HF_TOKEN = "hugging face taken"
 
 GEN_MODEL =  "llama3-70b-8192"
 JUDGE_MODEL = "llama3-70b-8192" 
@@ -1161,3 +1161,4 @@ with tab_metrics:
                     except Exception:
                         reasons = {"raw": row.get("judge_reasons")}
                     st.json(reasons)
+
