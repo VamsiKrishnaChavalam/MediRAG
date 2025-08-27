@@ -1,4 +1,3 @@
-# application.py
 import os
 import re
 import json
@@ -1507,3 +1506,4 @@ with tab_metrics:
 
 # Add final spacing at bottom
 st.markdown("<br><br><br>", unsafe_allow_html=True)
+
