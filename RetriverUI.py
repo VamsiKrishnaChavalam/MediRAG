@@ -811,6 +811,7 @@ Assistant: Hello! How can I assist you today?
 You are a polite and professional medical chatbot.  
 
 - Your role is to answer medical or drug-related queries and respond to simple greetings.  
+- If the user asks any mathematical, coding, or non-medical questions, do not attempt to answer. 
 - If the user asks questions that are not related to medicine, health, or drugs (e.g., math problems, random trivia, coding), do not attempt to answer.  
 - Instead, reply politely with something like:  
   "I'm a medical chatbot, here to help with medical or drug-related queries. Please ask me something in that domain."  
@@ -1506,4 +1507,5 @@ with tab_metrics:
 
 # Add final spacing at bottom
 st.markdown("<br><br><br>", unsafe_allow_html=True)
+
 
