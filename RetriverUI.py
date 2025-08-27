@@ -1,453 +1,641 @@
+# application.py
 import os
 import re
 import json
 import time
 import tempfile
 from datetime import datetime
+
 import streamlit as st
 import nltk
 import pytesseract
 from pdf2image import convert_from_path
+
+# Pinecone & hybrid search (new pinecone package)
 from pinecone import Pinecone
 from pinecone_text.sparse import BM25Encoder
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.retrievers import PineconeHybridSearchRetriever
+
+# OpenAI-compatible (Groq) client
 import openai
 import pandas as pd
 
+# -----------------------------
+# One-time NLTK setup
+# -----------------------------
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download("punkt", quiet=True)
 
 # -----------------------------
-# Streamlit page config & CSS
+# Streamlit page config & Optimized CSS
 # -----------------------------
-st.set_page_config(page_title="MediRAG - AI Medical Assistant", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="MediRAG", 
+    layout="wide", 
+    initial_sidebar_state="expanded",
+    
+)
 
 st.markdown("""
-
 <style>
     /* Import Google Fonts */
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    
+    /* CSS Variables */
+    :root {
+        --bg-primary: #0f1419;
+        --bg-secondary: #1a1f2e;
+        --bg-tertiary: #252b3a;
+        --bg-accent: #2a3441;
+        --text-primary: #e8eaed;
+        --text-secondary: #9aa0a6;
+        --color-accent: #4285f4;
+        --color-success: #34a853;
+        --color-warning: #fbbc04;
+        --color-error: #ea4335;
+        --border-color: #3c4043;
+        --border-radius: 12px;
+        --border-radius-sm: 8px;
+        --shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+        --shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.4);
+        --transition: all 0.2s ease;
+        --space-xs: 0.5rem;
+        --space-sm: 1rem;
+        --space-md: 1.5rem;
+        --space-lg: 2rem;
+    }
     
     /* Global Styles */
     .stApp {
-        background-color: #343541;
+        background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        color: var(--text-primary);
     }
     
-    /* Hide Streamlit elements */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    .stDeployButton {display: none;}
+    /* Hide Streamlit branding */
+    #MainMenu, footer, header, .stDeployButton {display: none;}
     
     /* Main container */
     .main .block-container {
-        padding-top: 1rem;
-        padding-bottom: 2rem;
+        padding: var(--space-md) var(--space-lg);
         max-width: 100%;
     }
     
-    /* Header styling */
+    /* App Header */
     .app-header {
-        background: linear-gradient(135deg, #40414f 0%, #2d2e3f 100%);
-        padding: 1.5rem 2rem;
-        border-radius: 12px;
-        margin-bottom: 1rem;
-        border: 1px solid #565869;
-        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        background: linear-gradient(135deg, var(--bg-tertiary) 0%, var(--bg-accent) 100%);
+        padding: var(--space-lg);
+        border-radius: var(--border-radius);
+        margin-bottom: var(--space-md);
+        border: 1px solid var(--border-color);
+        box-shadow: var(--shadow-lg);
+        text-align: center;
     }
     
     .app-header h1 {
-        color: #ececf1;
-        font-size: 2rem;
-        font-weight: 600;
-        margin: 0;
-        text-align: center;
+        color: var(--text-primary);
+        font-size: 2.5rem;
+        font-weight: 700;
+        margin: 0 0 var(--space-xs) 0;
+        background: linear-gradient(135deg, var(--text-primary), var(--color-accent));
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
     }
     
     .app-header .subtitle {
-        color: #8e8ea0;
-        text-align: center;
-        margin-top: 0.5rem;
+        color: var(--text-secondary);
+        margin: 0;
         font-size: 1.1rem;
+        font-weight: 400;
     }
     
-    /* Chat container */
+    /* Chat Container */
     .chat-container {
-        background: #343541;
-        border-radius: 12px;
-        border: 1px solid #4a4a4a;
+        background: var(--bg-secondary);
+        border-radius: var(--border-radius);
+        border: 1px solid var(--border-color);
         min-height: 500px;
         max-height: 600px;
         overflow-y: auto;
-        padding: 0;
-        margin-bottom: 1rem;
+        margin-bottom: var(--space-md);
+        box-shadow: var(--shadow);
     }
     
     .chat-container::-webkit-scrollbar {
-        width: 8px;
-    }
-    
-    .chat-container::-webkit-scrollbar-track {
-        background: #40414f;
-        border-radius: 4px;
+        width: 6px;
     }
     
     .chat-container::-webkit-scrollbar-thumb {
-        background: #565869;
-        border-radius: 4px;
+        background: var(--border-color);
+        border-radius: 3px;
     }
     
-    /* Welcome message */
+    /* Welcome Message */
     .welcome-message {
         display: flex;
         align-items: center;
         justify-content: center;
-        height: 500px;
+        min-height: 500px;
         text-align: center;
-        padding: 2rem;
-        color: #ececf1;
+        padding: var(--space-lg);
+        color: var(--text-primary);
     }
     
     .welcome-content h2 {
-        font-size: 2rem;
-        margin-bottom: 1rem;
-        color: #ececf1;
+        font-size: 2.2rem;
+        margin-bottom: var(--space-md);
+        color: var(--text-primary);
         font-weight: 600;
+        background: linear-gradient(135deg, var(--text-primary), var(--color-accent));
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
     }
     
     .welcome-content p {
-        color: #8e8ea0;
+        color: var(--text-secondary);
         line-height: 1.6;
-        margin-bottom: 2rem;
+        margin-bottom: var(--space-lg);
         font-size: 1.1rem;
+        max-width: 600px;
+        margin-left: auto;
+        margin-right: auto;
     }
     
     .feature-cards {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-        gap: 1rem;
-        max-width: 600px;
+        gap: var(--space-md);
+        max-width: 700px;
         margin: 0 auto;
     }
     
     .feature-card {
-        background: #2d2e3f;
-        padding: 1.5rem;
-        border-radius: 8px;
-        border: 1px solid #565869;
+        background: var(--bg-tertiary);
+        padding: var(--space-md);
+        border-radius: var(--border-radius-sm);
+        border: 1px solid var(--border-color);
         text-align: center;
-        transition: all 0.3s ease;
+        transition: var(--transition);
+        min-height: 120px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
     }
     
     .feature-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
+        transform: translateY(-4px);
+        box-shadow: var(--shadow-lg);
+        border-color: var(--color-accent);
     }
     
     .feature-card h4 {
-        color: #ececf1;
-        margin-bottom: 0.5rem;
-        font-size: 0.875rem;
+        color: var(--text-primary);
+        margin-bottom: var(--space-xs);
+        font-size: 1rem;
         font-weight: 600;
     }
     
     .feature-card p {
-        color: #8e8ea0;
-        font-size: 0.75rem;
+        color: var(--text-secondary);
+        font-size: 0.9rem;
         margin: 0;
+        line-height: 1.4;
     }
     
-    /* Message styling */
+    /* Message Styling */
     .message-row {
-        border-bottom: 1px solid #4a4a4a;
+        border-bottom: 1px solid var(--border-color);
         padding: 0;
         margin: 0;
+        transition: var(--transition);
     }
     
     .user-message-row {
-        background: #343541;
+        background: var(--bg-secondary);
+    }
+    
+    .user-message-row:hover {
+        background: var(--bg-tertiary);
     }
     
     .bot-message-row {
-        background: #444654;
+        background: var(--bg-tertiary);
+    }
+    
+    .bot-message-row:hover {
+        background: var(--bg-accent);
     }
     
     .message-content {
-        max-width: 768px;
+        max-width: 800px;
         margin: 0 auto;
-        padding: 2rem;
+        padding: var(--space-md);
         display: flex;
-        gap: 1.5rem;
+        gap: var(--space-sm);
         align-items: flex-start;
     }
     
     .message-avatar {
-        width: 40px;
-        height: 30px;
-        border-radius: 2px;
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 1rem;
+        font-size: 0.8rem;
         font-weight: 600;
         flex-shrink: 0;
+        box-shadow: var(--shadow);
     }
     
     .user-avatar {
-        background: #10a37f;
+        background: linear-gradient(135deg, var(--color-accent), #5a9fd4);
         color: white;
     }
     
     .bot-avatar {
-        background: #19c37d;
+        background: linear-gradient(135deg, var(--color-success), #4caf50);
         color: white;
     }
     
     .message-text {
         flex: 1;
-        line-height: 1.7;
-        color: #ececf1;
+        line-height: 1.6;
+        color: var(--text-primary);
+        font-size: 0.95rem;
     }
     
     .message-text p {
-        margin-bottom: 1rem;
-        color: #ececf1;
+        margin-bottom: var(--space-sm);
+        color: var(--text-primary);
     }
     
     .message-text p:last-child {
         margin-bottom: 0;
     }
     
-    /* Sidebar styling */
-    .css-1d391kg {
-        background-color: #202123;
-    }
-    
+    /* Sidebar */
     .sidebar-content {
-        background: #202123;
-        color: #ececf1;
-        padding: 1rem;
+        background: var(--bg-secondary);
+        color: var(--text-primary);
+        padding: var(--space-sm);
     }
     
     .upload-section {
-        background: #2d2e3f;
-        padding: 1rem;
-        border-radius: 8px;
-        border: 1px solid #565869;
-        margin-bottom: 1rem;
+        background: var(--bg-tertiary);
+        padding: var(--space-md);
+        border-radius: var(--border-radius-sm);
+        border: 1px solid var(--border-color);
+        margin-bottom: var(--space-md);
+        transition: var(--transition);
+        position: relative;
+    }
+    
+    .upload-section::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: linear-gradient(90deg, var(--color-accent), var(--color-success));
+    }
+    
+    .upload-section:hover {
+        border-color: var(--color-accent);
+        box-shadow: var(--shadow);
     }
     
     .upload-section h4 {
-        color: #ececf1;
-        font-size: 0.875rem;
-        margin-bottom: 0.5rem;
+        color: var(--text-primary);
+        font-size: 1rem;
+        margin-bottom: var(--space-xs);
         font-weight: 600;
     }
     
     .upload-section p {
-        color: #8e8ea0;
-        font-size: 0.75rem;
-        margin-bottom: 1rem;
-        line-height: 1.4;
+        color: var(--text-secondary);
+        font-size: 0.9rem;
+        margin-bottom: var(--space-sm);
+        line-height: 1.5;
     }
     
-    /* Input styling */
-    .stTextInput > div > div > input {
-        background-color: #40414f;
-        border: 1px solid #565869;
-        border-radius: 6px;
-        color: #ececf1;
-        padding: 0.75rem 1rem;
-    }
-    
-    .stTextInput > div > div > input:focus {
-        border-color: #10a37f;
-        box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.2);
-    }
-    
+    /* Input Styling */
+    .stTextInput > div > div > input,
     .stTextArea > div > div > textarea {
-        background-color: #40414f;
-        border: 1px solid #565869;
-        border-radius: 6px;
-        color: #ececf1;
-        padding: 0.75rem 1rem;
+        background-color: var(--bg-accent) !important;
+        border: 1px solid var(--border-color) !important;
+        border-radius: var(--border-radius-sm) !important;
+        color: var(--text-primary) !important;
+        padding: var(--space-sm) !important;
+        font-size: 0.95rem !important;
+        transition: var(--transition) !important;
     }
     
+    .stTextInput > div > div > input:focus,
     .stTextArea > div > div > textarea:focus {
-        border-color: #10a37f;
-        box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.2);
+        border-color: var(--color-accent) !important;
+        box-shadow: 0 0 0 2px rgba(66, 133, 244, 0.15) !important;
+        outline: none !important;
     }
     
-    /* Button styling */
+    /* Button Styling */
     .stButton > button {
-        background-color: #19c37d;
-        color: white;
-        border: none;
-        border-radius: 6px;
-        padding: 0.5rem 1rem;
-        font-weight: 500;
-        transition: all 0.2s;
+        background: linear-gradient(135deg, var(--color-accent), #5a9fd4) !important;
+        color: white !important;
+        border: none !important;
+        border-radius: var(--border-radius-sm) !important;
+        padding: var(--space-sm) var(--space-md) !important;
+        font-weight: 500 !important;
+        font-size: 0.95rem !important;
+        transition: var(--transition) !important;
+        box-shadow: var(--shadow) !important;
+        min-height: 42px !important;
     }
     
     .stButton > button:hover {
-        background-color: #10a37f;
-        transform: translateY(-1px);
+        background: linear-gradient(135deg, #3367d6, var(--color-accent)) !important;
+        transform: translateY(-1px) !important;
+        box-shadow: var(--shadow-lg) !important;
+    }
+    
+    /* Feedback buttons */
+    .feedback-section {
+        margin-top: var(--space-sm);
+        padding-top: var(--space-sm);
+        border-top: 1px solid var(--border-color);
+    }
+    
+    .feedback-btn {
+        background: var(--bg-tertiary) !important;
+        border: 1px solid var(--border-color) !important;
+        color: var(--text-secondary) !important;
+        font-size: 0.85rem !important;
+        padding: var(--space-xs) var(--space-sm) !important;
+        margin: var(--space-xs) !important;
+        min-height: 32px !important;
+        border-radius: var(--border-radius-sm) !important;
+    }
+    
+    .feedback-btn:hover {
+        background: var(--bg-accent) !important;
+        border-color: var(--color-accent) !important;
+        color: var(--text-primary) !important;
     }
     
     /* File uploader */
     .stFileUploader > div > div > div {
-        background-color: #40414f;
-        border: 1px solid #565869;
-        border-radius: 6px;
+        background-color: var(--bg-accent) !important;
+        border: 2px dashed var(--border-color) !important;
+        border-radius: var(--border-radius-sm) !important;
+        transition: var(--transition) !important;
+        padding: var(--space-md) !important;
+        min-height: 100px !important;
     }
     
-    /* Status messages */
+    .stFileUploader > div > div > div:hover {
+        border-color: var(--color-accent) !important;
+        background-color: var(--bg-tertiary) !important;
+    }
+    
+    /* Status Messages */
     .status-message {
-        padding: 0.75rem 1rem;
-        border-radius: 6px;
-        margin: 1rem 0;
-        font-size: 0.875rem;
+        padding: var(--space-sm) var(--space-md);
+        border-radius: var(--border-radius-sm);
+        margin: var(--space-sm) 0;
+        font-size: 0.9rem;
+        font-weight: 500;
+        display: flex;
+        align-items: center;
+        gap: var(--space-xs);
+        line-height: 1.4;
     }
     
     .success-message {
-        background: rgba(16, 163, 127, 0.1);
-        color: #10a37f;
-        border: 1px solid rgba(16, 163, 127, 0.3);
+        background: rgba(52, 168, 83, 0.1);
+        color: var(--color-success);
+        border: 1px solid rgba(52, 168, 83, 0.3);
+    }
+    
+    .success-message::before {
+        content: '✓';
+        font-weight: bold;
     }
     
     .error-message {
-        background: rgba(239, 68, 68, 0.1);
-        color: #ef4444;
-        border: 1px solid rgba(239, 68, 68, 0.3);
+        background: rgba(234, 67, 53, 0.1);
+        color: var(--color-error);
+        border: 1px solid rgba(234, 67, 53, 0.3);
     }
     
-    /* Labels and text */
-    .stMarkdown, .stText {
-        color: #ececf1;
+    .error-message::before {
+        content: '⚠';
+        font-weight: bold;
     }
     
-    label {
-        color: #ececf1 !important;
+    .info-message {
+        background: rgba(66, 133, 244, 0.1);
+        color: var(--color-accent);
+        border: 1px solid rgba(66, 133, 244, 0.3);
     }
     
-    /* Spinner */
-    .stSpinner {
-        color: #10a37f;
+    .info-message::before {
+        content: 'ℹ';
+        font-weight: bold;
+    }
+    
+    /* Health Indicator */
+    .health-indicator {
+        display: flex;
+        align-items: center;
+        gap: var(--space-xs);
+        padding: var(--space-sm);
+        background: var(--bg-tertiary);
+        border-radius: var(--border-radius-sm);
+        margin: var(--space-sm) 0;
+        border: 1px solid var(--border-color);
+        transition: var(--transition);
+    }
+    
+    .health-indicator:hover {
+        background: var(--bg-accent);
+    }
+    
+    .health-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        animation: pulse 2s infinite;
+    }
+    
+    .health-healthy {
+        background: var(--color-success);
+        color: var(--color-success);
+        box-shadow: 0 0 6px currentColor;
+    }
+    
+    .health-error {
+        background: var(--color-error);
+        color: var(--color-error);
+        box-shadow: 0 0 6px currentColor;
+    }
+    
+    .health-text {
+        font-size: 0.85rem;
+        color: var(--text-secondary);
+        font-weight: 500;
+    }
+    
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+    
+    /* Metrics */
+    [data-testid="stMetricValue"] {
+        color: var(--color-accent) !important;
+        font-weight: 700 !important;
+        font-size: 1.8rem !important;
+        font-family: 'Inter', sans-serif !important;
+    }
+    
+    [data-testid="stMetricLabel"] {
+        color: var(--text-primary) !important;
+        font-weight: 600 !important;
+        font-size: 0.9rem !important;
+    }
+    
+    .stMetric {
+        background: var(--bg-tertiary) !important;
+        padding: var(--space-sm) !important;
+        border-radius: var(--border-radius-sm) !important;
+        border: 1px solid var(--border-color) !important;
+        margin: var(--space-xs) 0 !important;
+    }
+    
+    /* Dashboard */
+    .dashboard-card {
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--border-radius-sm);
+        padding: var(--space-md);
+        margin: var(--space-sm) 0;
+        box-shadow: var(--shadow);
+        transition: var(--transition);
+    }
+    
+    .dashboard-card:hover {
+        border-color: var(--color-accent);
+        box-shadow: var(--shadow-lg);
+    }
+    
+    .dashboard-card h3 {
+        color: var(--text-primary);
+        margin-bottom: var(--space-sm);
+        font-weight: 600;
+        font-size: 1.1rem;
+    }
+    
+    /* Section headers */
+    .section-header {
+        font-size: 1.3rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        margin: var(--space-lg) 0 var(--space-md) 0;
+        padding-bottom: var(--space-xs);
+        border-bottom: 2px solid var(--border-color);
     }
     
     /* Tabs */
     .stTabs [data-baseweb="tab-list"] {
-        background-color: #40414f;
-        border-radius: 6px;
+        background-color: var(--bg-tertiary) !important;
+        border-radius: var(--border-radius-sm) !important;
+        padding: var(--space-xs) !important;
+        border: 1px solid var(--border-color) !important;
+        margin-bottom: var(--space-md) !important;
     }
     
     .stTabs [data-baseweb="tab"] {
-        color: #8e8ea0;
-        background-color: transparent;
+        color: var(--text-secondary) !important;
+        background-color: transparent !important;
+        border-radius: var(--border-radius-sm) !important;
+        font-weight: 500 !important;
+        transition: var(--transition) !important;
+        padding: var(--space-sm) !important;
     }
     
     .stTabs [aria-selected="true"] {
-        color: #ececf1;
-        background-color: #565869;
+        color: var(--text-primary) !important;
+        background: linear-gradient(135deg, var(--color-accent), #5a9fd4) !important;
+        box-shadow: var(--shadow) !important;
     }
     
-    /* Chat input area - Fixed at bottom */
-    .chat-input-container {
-        position: fixed;
-        bottom: 0;
-        left: 0;
-        right: 0;
-        background: #343541;
-        padding: 1rem 2rem 2rem;
-        border-top: 1px solid #4a4a4a;
-        z-index: 1000;
-        box-shadow: 0 -4px 15px rgba(0, 0, 0, 0.2);
+    /* Form */
+    .stForm {
+        background: var(--bg-tertiary);
+        padding: var(--space-md);
+        border-radius: var(--border-radius-sm);
+        border: 1px solid var(--border-color);
+        margin: var(--space-sm) 0;
+        box-shadow: var(--shadow);
     }
     
-    .input-wrapper {
-        background: #40414f;
-        border: 1px solid #565869;
-        border-radius: 12px;
-        padding: 0.75rem 1rem;
-        display: flex;
-        align-items: flex-end;
-        gap: 0.75rem;
-        max-width: 768px;
-        margin: 0 auto;
-        transition: all 0.2s;
+    /* DataFrame */
+    .stDataFrame {
+        margin: var(--space-sm) 0 !important;
+        border-radius: var(--border-radius-sm) !important;
+        overflow: hidden !important;
+        box-shadow: var(--shadow) !important;
     }
     
-    .input-wrapper:focus-within {
-        border-color: #10a37f;
-        box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.2);
-    }
-    
-    /* Add padding to main content to avoid overlap with fixed input */
-    .main .block-container {
-        padding-bottom: 120px;
-    }
-    
-    /* Health status indicator */
-    .health-indicator {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.5rem;
-        background: #2d2e3f;
-        border-radius: 6px;
-        margin-top: 1rem;
-    }
-    
-    .health-dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-    }
-    
-    .health-healthy {
-        background: #10a37f;
-    }
-    
-    .health-error {
-        background: #ef4444;
-    }
-    
-    .health-text {
-        font-size: 0.75rem;
-        color: #8e8ea0;
-    }
-      /* Fix metric numbers */
-    [data-testid="stMetricValue"] {
-        color: #00FFAA !important;   /* bright teal */
-        font-weight: 700;
-        font-size: 1.5rem;
-    }
-
-    /* Fix metric labels */
-    [data-testid="stMetricLabel"] {
-        color: #FFFFFF !important;   /* white */
-        font-weight: 500;
-    }
-    <style>
-    [data-testid="stMetricValue"] {
-        color: #00FFAA !important;   /* bright teal */
-        font-weight: 700;
-    }
-    [data-testid="stMetricLabel"] {
-        color: #FFFFFF !important;
-    }
-
-
-    /* Fix dataframe / judge reasons table */
     .stDataFrame, .stDataFrame td, .stDataFrame th {
-        color: #ECECF1 !important;   /* light grey text */
-        font-size: 0.9rem;
+        color: var(--text-primary) !important;
+        font-size: 0.85rem !important;
+        background-color: var(--bg-tertiary) !important;
+        padding: var(--space-xs) !important;
     }
-
+    
+    .stDataFrame th {
+        background-color: var(--bg-accent) !important;
+        color: var(--text-primary) !important;
+        font-weight: 600 !important;
+        padding: var(--space-sm) var(--space-xs) !important;
+    }
+    
+    /* Responsive Design */
+    @media (max-width: 768px) {
+        .app-header h1 {
+            font-size: 2rem;
+        }
+        
+        .welcome-content h2 {
+            font-size: 1.8rem;
+        }
+        
+        .feature-cards {
+            grid-template-columns: 1fr;
+            gap: var(--space-sm);
+        }
+        
+        .message-content {
+            padding: var(--space-sm);
+        }
+        
+        .main .block-container {
+            padding: var(--space-sm);
+        }
+    }
+    
+    /* Utility classes */
+    .mb-sm { margin-bottom: var(--space-sm); }
+    .mb-md { margin-bottom: var(--space-md); }
+    .mt-sm { margin-top: var(--space-sm); }
+    .mt-md { margin-top: var(--space-md); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -470,16 +658,14 @@ def get_secret(name, default=None):
     except Exception:
         return os.environ.get(name, default)
 
-LLM_API_KEY = "your api key "
-PINECONE_API_KEY = "your pinecone db key"
+# API Keys - Replace with your actual keys
+LLM_API_KEY = "your llm api key"
+PINECONE_API_KEY = "your pinecone api key"
+PINECONE_INDEX_NAME = "your pinecone index"
+HF_TOKEN = "hugging face token"
 
-PINECONE_INDEX_NAME = "pine cone index"
-HF_TOKEN = "hugging face taken"
-
-GEN_MODEL =  "llama3-70b-8192"
-JUDGE_MODEL = "llama3-70b-8192" 
-
-
+GEN_MODEL = "llama3-70b-8192"
+JUDGE_MODEL = "llama3-70b-8192"
 
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
@@ -491,7 +677,6 @@ if HF_TOKEN:
 def initialize_services():
     try:
         if not (LLM_API_KEY and PINECONE_API_KEY):
-            # Allow continuing in dev even if keys not present, but mark unhealthy
             raise RuntimeError("Missing LLM_API_KEY or PINECONE_API_KEY")
 
         llm_client = openai.OpenAI(base_url="https://api.groq.com/openai/v1", api_key=LLM_API_KEY)
@@ -610,13 +795,12 @@ Now, based on the above context and chat history, answer the following question:
 
 Question: {query}
 
-
 Guidelines:
-- If the user greatss you, greet them back politely. do not add any citations for greeting . dont add any sources to the responce too.
+- If the user greets you, greet them back politely. do not add any citations for greeting. dont add any sources to the response too.
 - Always base your answers strictly on the provided context. Do not use any external knowledge or make assumptions.
 - Do not greet for every question asked. Greet only if the user greets you first.
 - Never fabricate or guess answers. If the information is not in the context, say you don't know.
-- Never start a resonse with "As an AI language model".
+- Never start a response with "As an AI language model".
 - Never provide medical advice beyond general information. Always recommend consulting a healthcare professional for specific concerns.
 - If the user asks for a summary of the documents, provide a brief overview without citations.
 - If the context contains "NO_RELEVANT_DOCUMENTS_FOUND", respond with: "I couldn't find this information in the uploaded documents."
@@ -625,10 +809,19 @@ Guidelines:
 User: Hello
 Assistant: Hello! How can I assist you today?
 
+You are a polite and professional medical chatbot.  
+
+- Your role is to answer medical or drug-related queries and respond to simple greetings.  
+- If the user asks questions that are not related to medicine, health, or drugs (e.g., math problems, random trivia, coding), do not attempt to answer.  
+- Instead, reply politely with something like:  
+  "I'm a medical chatbot, here to help with medical or drug-related queries. Please ask me something in that domain."  
+
+Always keep your tone helpful, clear, and user-friendly.
+
 1. Standard Structure
 - Every drug/condition response should follow the same clear sections:
 - Drug Summary / Overview – short description (name, class, purpose).
-- Usage / Indications – what it’s used for.
+- Usage / Indications – what it's used for.
 - Dosage & Administration
 - Adult dose
 - Pediatric dose
@@ -647,8 +840,8 @@ Assistant: Hello! How can I assist you today?
 
 3. Safety First
 
-- Never give exact personalized medical advice (like “you should take X now”).
-- Always include disclaimer: “This information is for educational purposes only and not a substitute for professional medical advice.”
+- Never give exact personalized medical advice (like "you should take X now").
+- Always include disclaimer: "This information is for educational purposes only and not a substitute for professional medical advice."
 - Encourage users to consult a healthcare professional.
 
 4. Consistency Rules
@@ -799,54 +992,38 @@ if "upload_status" not in st.session_state:
 if "last_answer_idx" not in st.session_state:
     st.session_state.last_answer_idx = None
 if "feedback" not in st.session_state:
-    st.session_state.feedback = [] 
-
-def render_chat_message(role, content, index, query=None):
-    with st.chat_message(role):
-        st.markdown(content)
-
-        # Only show feedback for assistant messages
-        if role == "assistant":
-            col1, col2 = st.columns([0.15, 0.15])
-            with col1:
-                if st.button("👍", key=f"up_{index}"):
-                    st.session_state["feedback"].append({
-                        "query": query,
-                        "response": content,
-                        "feedback": "up",
-                        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    })
-                    st.success("Thanks for your feedback!")
-            with col2:
-                if st.button("👎", key=f"down_{index}"):
-                    st.session_state["feedback"].append({
-                        "query": query,
-                        "response": content,
-                        "feedback": "down",
-                        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    })
-                    st.warning("Feedback noted!")
+    st.session_state.feedback = []
+if "file_processed" not in st.session_state:
+    st.session_state.file_processed = False
+if "last_uploaded_file" not in st.session_state:
+    st.session_state.last_uploaded_file = None
 
 # -----------------------------
-# App header
+# App header with enhanced spacing
 # -----------------------------
 st.markdown("""
 <div class="app-header">
     <h1>MediRAG - AI Medical Assistant</h1>
-    <div class="subtitle">Your intelligent medical information companion</div>
+    <div class="subtitle">Your intelligent medical information companion powered by advanced AI</div>
 </div>
 """, unsafe_allow_html=True)
 
+# Add some breathing room
+st.markdown("<br>", unsafe_allow_html=True)
+
 # -----------------------------
-# Tabs: Chat + Metrics
+# Tabs: Chat + Metrics with enhanced styling
 # -----------------------------
 tab_chat, tab_metrics = st.tabs(["Chat", "Metrics Dashboard"])
 
 # -----------------------------
-# CHAT TAB
+# ENHANCED CHAT TAB
 # -----------------------------
 with tab_chat:
-    col_main, col_sidebar = st.columns([3, 1])
+    # Add spacing before columns
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    col_main, col_sidebar = st.columns([3, 1], gap="large")
 
     with col_main:
         chat_container = st.container()
@@ -855,20 +1032,20 @@ with tab_chat:
                 st.markdown("""
                 <div class="welcome-message">
                     <div class="welcome-content">
-                        <h2> Welcome to MediRAG</h2>
-                        <p>I'm your AI-powered medical assistant. Upload PDFs for personalized responses.</p>
+                        <h2>🩺 Welcome to MediRAG</h2>
+                        <p>I'm your AI-powered medical assistant. Upload medical PDFs to get personalized, evidence-based responses with proper citations.</p>
                         <div class="feature-cards">
                             <div class="feature-card">
-                                <h4> Drug Information</h4>
-                                <p>Medication details, dosages, interactions.</p>
+                                <h4>💊 Drug Information</h4>
+                                <p>Comprehensive medication details, dosages, and interactions from uploaded documents.</p>
                             </div>
                             <div class="feature-card">
-                                <h4> Health Guidance</h4>
-                                <p>Evidence-based health advice.</p>
+                                <h4>🔬 Health Guidance</h4>
+                                <p>Evidence-based health advice and medical information.</p>
                             </div>
                             <div class="feature-card">
-                                <h4> PDF Analysis</h4>
-                                <p>Personalized insights from uploaded medical PDFs.</p>
+                                <h4>📄 PDF Analysis</h4>
+                                <p>Personalized insights extracted from your uploaded medical PDFs.</p>
                             </div>
                         </div>
                     </div>
@@ -880,7 +1057,7 @@ with tab_chat:
                         st.markdown(f"""
                         <div class="message-row user-message-row">
                             <div class="message-content">
-                                <div class="message-avatar user-avatar">User</div>
+                                <div class="message-avatar user-avatar">👤</div>
                                 <div class="message-text"><p>{m["content"]}</p></div>
                             </div>
                         </div>
@@ -897,71 +1074,60 @@ with tab_chat:
                             </div>
                         </div>
                         """, unsafe_allow_html=True)
-                        col1, col2 = st.columns([0.1, 0.1])
+                        
+                        # Enhanced feedback section with better spacing
+                        st.markdown('<div class="feedback-section">', unsafe_allow_html=True)
+                        col1, col2, col3 = st.columns([0.15, 0.15, 0.7])
                         with col1:
-                            if st.button("Is the responce relavent 👍", key=f"up_{i}"):
+                            if st.button("👍", key=f"up_{i}", help="Mark as helpful response", use_container_width=True):
                                 st.session_state.feedback.append({
-                                        "index": i,
-                                        "response": m["content"],
-                                        "feedback": "The response is relevant"
-                                    })
+                                    "index": i,
+                                    "response": m["content"],
+                                    "feedback": "The response is relevant and helpful"
+                                })
                                 if st.session_state.get("logs"):
-                                        st.session_state.logs[-1]["feedback"] = "Relevant response was provided"
-                                        pd.DataFrame(st.session_state.logs).to_csv("logs/metrics.csv", index=False)
+                                    st.session_state.logs[-1]["feedback"] = "Helpful response provided"
+                                    pd.DataFrame(st.session_state.logs).to_csv("logs/metrics.csv", index=False)
+                                st.success("Thank you for your feedback!")
 
                         with col2:
-                            if st.button("Bad response👎", key=f"down_{i}"):
+                            if st.button("👎", key=f"down_{i}", help="Mark as not helpful", use_container_width=True):
                                 st.session_state.feedback.append({
-                                        "index": i,
-                                        "response": m["content"],
-                                        "feedback": "The response is not relevant"
-                                    })
+                                    "index": i,
+                                    "response": m["content"],
+                                    "feedback": "The response needs improvement"
+                                })
                                 if st.session_state.get("logs"):
-                                    st.session_state.logs[-1]["feedback"] = "Irrelevant response was provided"
+                                    st.session_state.logs[-1]["feedback"] = "Response needs improvement"
                                     pd.DataFrame(st.session_state.logs).to_csv("logs/metrics.csv", index=False)
+                                st.warning("Thanks! We'll work on improving our responses.")
+                        st.markdown('</div>', unsafe_allow_html=True)
 
-
-        # Fixed chat input
-        st.markdown("""
-        <div class="chat-input-container">
-            <div class="input-wrapper"><div style="flex:1;"><div id="chat-input-placeholder"></div></div></div>
-        </div>
-        """, unsafe_allow_html=True)
-
+        # Enhanced chat input form with proper spacing
+        st.markdown("<br><br>", unsafe_allow_html=True)
         with st.form(key="chat_form", clear_on_submit=True):
-            user_input = st.text_input("Message", placeholder="Ask about the uploaded PDFs...", label_visibility="collapsed", key="message_input")
-            submit_button = st.form_submit_button("Send", type="primary")
-
-            st.markdown("""
-            <script>
-            // small JS - clone input into fixed area (kept from your original)
-            document.addEventListener('DOMContentLoaded', function() {
-                const input = document.querySelector('[data-testid="stTextInput"] input');
-                const placeholder = document.getElementById('chat-input-placeholder');
-                const form = document.querySelector('[data-testid="stForm"]');
-                const submitButton = document.querySelector('[data-testid="stForm"] button[kind="primaryFormSubmit"]');
-                if (input && placeholder) {
-                    const inputClone = input.cloneNode(true);
-                    inputClone.style.background='transparent'; inputClone.style.border='none'; inputClone.style.color='#ececf1';
-                    inputClone.style.fontSize='1rem'; inputClone.style.outline='none'; inputClone.style.width='100%'; inputClone.style.padding='.5rem 0';
-                    placeholder.appendChild(inputClone);
-                    const sendBtn = document.createElement('button'); sendBtn.innerHTML='➤';
-                    sendBtn.style.background='#19c37d'; sendBtn.style.border='none'; sendBtn.style.borderRadius='6px';
-                    sendBtn.style.width='32px'; sendBtn.style.height='32px'; sendBtn.style.color='white'; sendBtn.style.cursor='pointer';
-                    placeholder.parentElement.appendChild(sendBtn);
-                    inputClone.addEventListener('input', function(){ input.value=this.value; input.dispatchEvent(new Event('input',{bubbles:true})); });
-                    input.addEventListener('input', function(){ inputClone.value=this.value; });
-                    inputClone.addEventListener('keydown', function(e){ if (e.key==='Enter'){ e.preventDefault(); if (this.value.trim()){ input.value=this.value; input.dispatchEvent(new Event('input',{bubbles:true})); submitButton.click(); } }});
-                    sendBtn.addEventListener('click', function(e){ e.preventDefault(); if (inputClone.value.trim()){ input.value=inputClone.value; input.dispatchEvent(new Event('input',{bubbles:true})); submitButton.click(); }});
-                    if (form) { form.style.display='none'; }
-                    inputClone.focus();
-                }
-            });
-            </script>
-            """, unsafe_allow_html=True)
+            user_input = st.text_input(
+                "Message", 
+                placeholder="Ask about medications, conditions, or treatments from uploaded PDFs...", 
+                label_visibility="collapsed", 
+                key="message_input"
+            )
+            
+            # Add spacing between input and buttons
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            col1, col2, col3 = st.columns([0.7, 0.15, 0.15])
+            with col2:
+                submit_button = st.form_submit_button("Send", type="primary", use_container_width=True)
+            with col3:
+                if st.form_submit_button("Clear", use_container_width=True):
+                    st.session_state.messages = []
+                    st.session_state.last_answer_idx = None
+                    st.rerun()
 
             if submit_button and user_input.strip():
                 st.session_state.messages.append({"role": "user", "content": user_input.strip()})
+                
                 with st.spinner("Analyzing your question..."):
                     try:
                         if services["status"] != "healthy":
@@ -980,19 +1146,15 @@ with tab_chat:
 
                         # If the LLM replied with the abstain phrase or contexts empty, enforce abstain
                         if not contexts:
-                            final_answer = "I couldn't find this information in the uploaded documents."
+                            final_answer = "I couldn't find this information in the uploaded documents. Please upload relevant medical PDFs to get accurate answers."
                             used_contexts = []
                         else:
-                            # To be safe: if LLM used outside knowledge, judge or simple heuristic could detect.
-                            # But we will respect LLM output except when it clearly says it couldn't find.
                             # Build deterministic sources list from retrieved contexts
                             sources = format_sources_from_docs(contexts)
                             if "I couldn't find" in answer or "couldn't find" in answer.lower():
-                                final_answer = "I couldn't find this information in the uploaded documents."
+                                final_answer = "I couldn't find this information in the uploaded documents. Please upload relevant medical PDFs."
                                 used_contexts = []
                             else:
-                                # append Sources block deterministically (not trusting LLM for citation)
-                                source_text = "\n".join(f"- {s}" for s in sources) if sources else ""
                                 final_answer = answer
                                 used_contexts = contexts
 
@@ -1023,84 +1185,161 @@ with tab_chat:
                         pd.DataFrame(st.session_state.logs).to_csv("logs/metrics.csv", index=False)
 
                     except Exception as e:
-                        st.session_state.messages.append({"role": "assistant", "content": "I encountered an error while processing your request."})
+                        st.session_state.messages.append({"role": "assistant", "content": f"⚠️ I encountered an error while processing your request: {str(e)}"})
+                
                 st.rerun()
 
-    # Sidebar: PDF upload + services health
+    # Enhanced Sidebar with proper spacing
     with col_sidebar:
         st.markdown("""
         <div class="sidebar-content">
-            <div class="upload-section">
-                <h4> Upload Medical PDF</h4>
-                <p>Upload PDF documents. The assistant will answer using only uploaded PDFs and show sources (file + page).</p>
+            <div class="sidebar-section">
+                <div class="upload-section">
+                    <h4>Upload Medical PDF</h4>
+                    <p>Upload medical PDFs, research papers, or drug information documents. The assistant will provide answers based exclusively on uploaded content.</p>
+                </div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        uploaded_file = st.file_uploader("Choose a PDF file", type=['pdf'], help="Upload medical PDFs", label_visibility="collapsed")
+        # File uploader with enhanced feedback and spacing
+        uploaded_file = st.file_uploader(
+            "Choose a PDF file", 
+            type=['pdf'], 
+            help="Upload medical PDFs for accurate, evidence-based responses", 
+            label_visibility="collapsed"
+        )
 
+        # Add spacing after file uploader
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Process file only if it's new and not already processed
         if uploaded_file is not None:
-            with st.spinner("Processing your PDF..."):
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                        tmp_file.write(uploaded_file.read())
-                        pdf_path = tmp_file.name
+            file_id = f"{uploaded_file.name}_{uploaded_file.size}"
 
-                    pdf_name = uploaded_file.name
-                    pages = extract_text_pages(pdf_path, pdf_name)
+            if not st.session_state.file_processed or st.session_state.last_uploaded_file != file_id:
+                with st.spinner("Processing your PDF..."):
+                    try:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                            tmp_file.write(uploaded_file.read())
+                            pdf_path = tmp_file.name
 
-                    if not pages:
-                        st.markdown('<div class="status-message error-message">No text could be extracted from PDF</div>', unsafe_allow_html=True)
-                    else:
-                        all_texts, all_metas = [], []
-                        for p in pages:
-                            texts, metas = chunk_page_text(p, chunk_size=800)
-                            all_texts.extend(texts)
-                            all_metas.extend(metas)
+                        pdf_name = uploaded_file.name
+                        pages = extract_text_pages(pdf_path, pdf_name)
 
-                        if services['status'] == 'healthy':
-                            # fit BM25 and re-create retriever (keeps index same but uses new sparse encoder)
-                            services['bm25_encoder'].fit(all_texts)
-                            services['bm25_encoder'].dump(services['bm25_path'])
-
-                            services['retriever'] = PineconeHybridSearchRetriever(
-                                embeddings=services['embeddings'],
-                                sparse_encoder=services['bm25_encoder'],
-                                index=services['index']
+                        if not pages:
+                            st.markdown(
+                                '<div class="status-message error-message">No text could be extracted from the PDF. Please ensure the PDF contains readable text.</div>',
+                                unsafe_allow_html=True
                             )
-
-                            # Add texts to the index with metadata so we can cite file+page
-                            # retriever.add_texts should accept (texts, metadatas)
-                            services['retriever'].add_texts(texts=all_texts, metadatas=all_metas)
-
-                            st.markdown('<div class="status-message success-message">PDF processed and indexed successfully!</div>', unsafe_allow_html=True)
                         else:
-                            st.markdown('<div class="status-message error-message">Service unavailable for PDF processing</div>', unsafe_allow_html=True)
+                            all_texts, all_metas = [], []
+                            for p in pages:
+                                texts, metas = chunk_page_text(p, chunk_size=800)
+                                all_texts.extend(texts)
+                                all_metas.extend(metas)
 
-                    os.unlink(pdf_path)
-                except Exception as e:
-                    st.markdown(f'<div class="status-message error-message">Error processing PDF: {e}</div>', unsafe_allow_html=True)
+                            if services['status'] == 'healthy':
+                                # fit BM25 and re-create retriever
+                                services['bm25_encoder'].fit(all_texts)
+                                services['bm25_encoder'].dump(services['bm25_path'])
 
+                                services['retriever'] = PineconeHybridSearchRetriever(
+                                    embeddings=services['embeddings'],
+                                    sparse_encoder=services['bm25_encoder'],
+                                    index=services['index']
+                                )
+
+                                # add texts + metadata
+                                services['retriever'].add_texts(texts=all_texts, metadatas=all_metas)
+
+                                st.markdown(
+                                    f'<div class="status-message success-message">Successfully processed "{uploaded_file.name}" with {len(pages)} pages and {len(all_texts)} chunks!</div>',
+                                    unsafe_allow_html=True
+                                )
+                            else:
+                                st.markdown(
+                                    '<div class="status-message error-message">Service temporarily unavailable for PDF processing. Please try again later.</div>',
+                                    unsafe_allow_html=True
+                                )
+
+                        os.unlink(pdf_path)
+
+                        # Update session state
+                        st.session_state.file_processed = True
+                        st.session_state.last_uploaded_file = file_id
+
+                    except Exception as e:
+                        st.markdown(
+                            f'<div class="status-message error-message">Error processing PDF: {str(e)}</div>',
+                            unsafe_allow_html=True
+                        )
+            else:
+                st.markdown(
+                    f'<div class="status-message info-message">"{uploaded_file.name}" is already processed and ready to use!</div>',
+                    unsafe_allow_html=True
+                )
+
+        # Add divider with spacing
+        st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("---")
-        if st.button("Clear Chat", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.last_answer_idx = None
-            st.rerun()
-
-        st.markdown("---")
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # Enhanced system status section
+        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+        st.markdown("### System Status")
         if services.get('status') == 'healthy':
-            st.markdown("""<div class="health-indicator"><div class="health-dot health-healthy"></div><div class="health-text">All services online</div></div>""", unsafe_allow_html=True)
+            st.markdown("""
+            <div class="health-indicator">
+                <div class="health-dot health-healthy"></div>
+                <div class="health-text">All services online and ready</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
         else:
-            st.markdown(f"""<div class="health-indicator"><div class="health-dot health-error"></div><div class="health-text">Service issues: {services.get('error')}</div></div>""", unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class="health-indicator">
+                <div class="health-dot health-error"></div>
+                <div class="health-text">Service issues detected</div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.error(f"Service Error: {services.get('error', 'Unknown error')}")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # Quick stats section with spacing
+        if st.session_state.messages:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+            st.markdown("### Session Stats")
+            total_messages = len(st.session_state.messages)
+            user_messages = len([m for m in st.session_state.messages if m["role"] == "user"])
+            
+            # Create metrics with proper spacing
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Messages", total_messages)
+            with col2:
+                st.metric("User Questions", user_messages)
+            st.markdown('</div>', unsafe_allow_html=True)
 
 # -----------------------------
-# METRICS DASHBOARD TAB
+# ENHANCED METRICS DASHBOARD TAB
 # -----------------------------
 with tab_metrics:
-    st.title("📊 RAG Evaluation Dashboard")
+    # Add spacing at top of metrics tab
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    st.markdown('<h1 class="section-header">📊 RAG Evaluation Dashboard</h1>', unsafe_allow_html=True)
+    st.markdown("Real-time performance metrics and evaluation data for the MediRAG system.")
+    
+    # Add spacing after description
+    st.markdown("<br>", unsafe_allow_html=True)
 
     os.makedirs("logs", exist_ok=True)
     csv_path = "logs/metrics.csv"
+    
+    # Load and merge data
     if os.path.exists(csv_path):
         try:
             df_file = pd.read_csv(csv_path)
@@ -1115,38 +1354,156 @@ with tab_metrics:
         df = pd.DataFrame(st.session_state.logs)
 
     if df.empty:
-        st.info("No evaluation data yet. Start chatting to generate metrics.")
+        # Enhanced empty state with better spacing
+        st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+        st.info("No evaluation data available yet. Start chatting to generate metrics and insights!")
+        st.markdown("""
+        ### What you'll see here:
+        - **Faithfulness Score**: How well responses stick to the uploaded documents
+        - **Answer Relevancy**: How well responses address user questions  
+        - **Context Relevancy**: How relevant retrieved context is to queries
+        - **Response Times**: System performance metrics
+        - **User Feedback**: Real-time satisfaction tracking
+        """)
+        st.markdown('</div>', unsafe_allow_html=True)
     else:
+        # Convert numeric columns
         for col in ["faithfulness", "answer_relevancy", "context_relevancy", "gen_latency_sec", "eval_latency_sec"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        st.write("### Recent Interactions")
-        show_cols = ["time", "question", "faithfulness", "answer_relevancy", "context_relevancy", "gen_latency_sec", "eval_latency_sec", "feedback"]
-        st.dataframe(df[show_cols].tail(15), use_container_width=True)
+        # Summary metrics with enhanced spacing
+        st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+        st.markdown("### Performance Overview")
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        col1, col2, col3, col4 = st.columns(4, gap="large")
+        
+        with col1:
+            faith_avg = df['faithfulness'].mean() if 'faithfulness' in df.columns else 0
+            st.metric("Faithfulness", f"{faith_avg:.3f}", help="How well responses stick to document content")
+        
+        with col2:
+            ans_avg = df['answer_relevancy'].mean() if 'answer_relevancy' in df.columns else 0
+            st.metric("Answer Relevancy", f"{ans_avg:.3f}", help="How well responses address user questions")
+        
+        with col3:
+            ctx_avg = df['context_relevancy'].mean() if 'context_relevancy' in df.columns else 0
+            st.metric("Context Relevancy", f"{ctx_avg:.3f}", help="How relevant retrieved content is")
+        
+        with col4:
+            latency_avg = df['gen_latency_sec'].mean() if 'gen_latency_sec' in df.columns else 0
+            st.metric("Avg Response Time", f"{latency_avg:.2f}s", help="Average time to generate responses")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        st.write("### Trends")
-        if {"faithfulness","answer_relevancy","context_relevancy"}.issubset(df.columns):
-            st.line_chart(df[["faithfulness", "answer_relevancy", "context_relevancy"]])
+        # Add spacing between sections
+        st.markdown("<br><br>", unsafe_allow_html=True)
 
-        st.write("### Averages")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Faithfulness (avg)", f"{df['faithfulness'].mean():.2f}" if "faithfulness" in df else "—")
-        col2.metric("Answer Relevancy (avg)", f"{df['answer_relevancy'].mean():.2f}" if "answer_relevancy" in df else "—")
-        col3.metric("Context Relevancy (avg)", f"{df['context_relevancy'].mean():.2f}" if "context_relevancy" in df else "—")
-        if "gen_latency_sec" in df:
-            col4.metric("Gen Latency (avg s)", f"{df['gen_latency_sec'].mean():.2f}")
-        else:
-            col4.metric("Gen Latency (avg s)", "—")
+        # Interactive data table with enhanced styling
+        st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+        st.markdown("### Recent Interactions")
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        show_cols = ["time", "question", "faithfulness", "answer_relevancy", "context_relevancy", "gen_latency_sec", "feedback"]
+        available_cols = [col for col in show_cols if col in df.columns]
+        
+        if available_cols:
+            display_df = df[available_cols].tail(10).round(3)
+            st.dataframe(display_df, use_container_width=True, height=350)
+        
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        st.write("### Judge Reasons (last 5)")
-        if "judge_reasons" in df:
-            for _, row in df.tail(5).iterrows():
-                with st.expander(f"{row.get('time','')} — {row.get('question','')[:60]}"):
+        # Add spacing
+        st.markdown("<br><br>", unsafe_allow_html=True)
+
+        # Performance trends with enhanced styling
+        if {"faithfulness", "answer_relevancy", "context_relevancy"}.issubset(df.columns):
+            st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+            st.markdown("### Performance Trends")
+            st.markdown("<br>", unsafe_allow_html=True)
+            chart_data = df[["faithfulness", "answer_relevancy", "context_relevancy"]].tail(20)
+            st.line_chart(chart_data, height=400)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # Add spacing
+        st.markdown("<br><br>", unsafe_allow_html=True)
+
+        # Detailed analysis with better layout
+        col1, col2 = st.columns(2, gap="large")
+        
+        with col1:
+            if "gen_latency_sec" in df.columns:
+                st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+                st.markdown("### Response Time Distribution")
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.bar_chart(df["gen_latency_sec"].tail(10), height=300)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        with col2:
+            if "feedback" in df.columns:
+                feedback_counts = df["feedback"].value_counts()
+                if not feedback_counts.empty:
+                    st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+                    st.markdown("### User Feedback Summary")
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    for feedback, count in feedback_counts.items():
+                        if feedback and feedback != "None":
+                            st.write(f"**{feedback}**: {count} responses")
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+        # Add spacing
+        st.markdown("<br><br>", unsafe_allow_html=True)
+
+        # Judge reasoning analysis with enhanced styling
+        st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+        st.markdown("### AI Judge Analysis (Last 5 Interactions)")
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        if "judge_reasons" in df.columns:
+            for idx, (_, row) in enumerate(df.tail(5).iterrows()):
+                with st.expander(f"Query {idx + 1}: {row.get('question', '')[:80]}..."):
                     try:
-                        reasons = json.loads(row.get("judge_reasons","{}"))
+                        reasons = json.loads(row.get("judge_reasons", "{}"))
+                        for dimension, reason in reasons.items():
+                            if reason:
+                                st.write(f"**{dimension.title()}**: {reason}")
                     except Exception:
-                        reasons = {"raw": row.get("judge_reasons")}
-                    st.json(reasons)
+                        st.write("Raw judge data:", row.get("judge_reasons", "No data"))
+        
+        st.markdown('</div>', unsafe_allow_html=True)
 
+        # Add spacing
+        st.markdown("<br><br>", unsafe_allow_html=True)
 
+        # Export functionality with enhanced styling
+        st.markdown('<div class="dashboard-card">', unsafe_allow_html=True)
+        st.markdown("### Data Export")
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2, gap="medium")
+        with col1:
+            if st.button("Download CSV", use_container_width=True):
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="Download Complete Data",
+                    data=csv,
+                    file_name=f"medirag_metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+        
+        with col2:
+            if st.button("Clear All Data", use_container_width=True):
+                # Add a confirmation dialog
+                if st.button("⚠️ Confirm Clear All", use_container_width=True):
+                    st.session_state.logs = []
+                    if os.path.exists(csv_path):
+                        os.remove(csv_path)
+                    st.success("All data cleared!")
+                    st.rerun()
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# Add final spacing at bottom
+st.markdown("<br><br><br>", unsafe_allow_html=True)
