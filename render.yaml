@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: MediRAG
+    name: MediRAG-1
     env: python
     buildCommand: ""
     startCommand: "streamlit run application.py"
